@@ -1,10 +1,10 @@
-//! Subscription-only ThogAMM updates. Startup takes one snapshot; the running
-//! client owns no RPC reader. Proposed logs become an atomic model when Monad's
-//! ordered commitment stream finalizes their block.
+//! Quote ThogAMM locally in your aggregator using state kept up to date by events.
+//! Connect once to load initial state; later updates consume subscriptions only.
+//! Published snapshots represent complete finalized blocks on Monad.
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{btree_map::Entry, BTreeMap, VecDeque};
-pub use thogamm_model::{self as model, Address, Error, ExecutionContext, PoolModel, Result, U256};
+pub use thogamm_model::{self as model, Address, Error, PoolModel, Result, U256};
 use thogamm_model::{
     events::{apply_owned_block, log_filters},
     rpc::{snapshot, CallBlock, ChainReader, HttpRpc},
@@ -16,7 +16,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Immutable legacy registry token 3; must match the seed image.
+    /// Wrapped MON token used to track pool balances. Defaults to Monad mainnet WMON.
     pub wmon: Address,
 }
 impl Default for Config {
@@ -59,8 +59,8 @@ pub struct EventSynchronizer {
     failed: bool,
 }
 impl EventSynchronizer {
-    /// The caller supplies a finalized seed and a continuous subscription stream
-    /// covering its successors. This constructor performs no I/O.
+    /// Use your own finalized pool snapshot and subsequent event stream.
+    /// The snapshot must have its known block hash. This constructor performs no I/O.
     pub fn from_model(model: PoolModel) -> Result<Self> {
         if model.state().block.hash.is_none() {
             return Err(Error::InvalidData(
@@ -225,8 +225,9 @@ pub struct EventDrivenSdk {
     queued: VecDeque<Value>,
 }
 impl EventDrivenSdk {
-    /// Creates subscriptions first, waits for an observed proposal to finalize,
-    /// then makes exactly one hash-pinned getPoolData(0,64) call to seed the model.
+    /// Connect using Monad HTTP/WebSocket endpoints and the ThogAMM pool address.
+    /// Establishes subscriptions and loads initial state with one call. Subsequent
+    /// updates use the subscriptions without further state reads.
     pub async fn connect(
         http_url: impl Into<String>,
         ws_url: impl AsRef<str>,
