@@ -2,6 +2,7 @@
 
 | Symptom | Meaning and action |
 | --- | --- |
+| Fresh Git install selects a dependency requiring Rust newer than 1.88 | Configure the consuming application with `rust-version = "1.88"` and resolver 3 as in the README. The SDK's lockfile does not control another application's dependency resolution. Review existing lock entries if they were selected under another policy. |
 | `eth_call` reverts or returns empty bytes | Verify the chain, proxy, schema-6 implementation and `(0,64)` interface. Publication of the SDK does not upgrade the contract. |
 | `UnsupportedSchema` / invalid image | Use the SDK release matching the implementation; pass the complete raw ABI return bytes, not a JSON envelope or a partial page. |
 | Execution friction differs from settlement | Supply the effective gas price for the landing block and the actual FastLane warmth at the contract's check. Preserve the nonzero simulation gas price on the snapshot call. |

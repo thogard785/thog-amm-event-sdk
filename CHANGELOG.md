@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased documentation
+
+- Document consuming-application resolver 3 and Rust-version configuration for
+  reproducible Git installation on the minimum supported compiler.
+
 ## 0.1.0 — 2026-09-21
 
 - Initial public `thog-amm-event-sdk` release under the MIT license.
