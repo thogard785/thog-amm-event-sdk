@@ -1,0 +1,28 @@
+[workspace]
+members = ["event-driven-sdk"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+repository = "https://github.com/thogard785/thog-amm-event-sdk"
+
+[workspace.dependencies]
+alloy-primitives = { version = "=1.7.3", features = ["serde"] }
+alloy-sol-types = "=1.7.3"
+flate2 = "1.1"
+async-trait = "0.1.89"
+futures-util = { version = "0.3.31", features = ["sink"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time", "net", "sync", "io-util"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
+thogamm-model = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.1.0" }
+
+[profile.release]
+overflow-checks = true
