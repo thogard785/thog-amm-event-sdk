@@ -1,178 +1,114 @@
-# thog-amm-event-sdk
+# ThogAMM event SDK
 
-[![Rust SDK](https://github.com/thogard785/thog-amm-event-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/thogard785/thog-amm-event-sdk/actions/workflows/ci.yml)
-
-Rust SDK for deterministic ThogAMM quotes from **pushed Monad events**.
-Initialization uses five subscriptions and one snapshot call. After startup,
-updates perform **zero read RPCs** and publish complete finalized models.
-
-
-Both SDKs share the exact integer `thogamm-model` engine. It models all 64 token
-slots, actual balances, portfolio risk, pair spreads, inventory limits, pauses,
-staleness and execution friction. Quotes return raw `U256` token amounts.
-For the other update mechanism, see the [snapshot/polling SDK](https://github.com/thogard785/thog-amm-poll-sdk).
-
-**Requires a compatible schema-6 ThogAMM deployment.** A published SDK does not
-upgrade the live pool. Configure a verified proxy; see [deployment requirements](docs/DEPLOYMENT.md).
-This library does not sign or submit transactions.
+Maintain a deterministic in-memory ThogAMM model from Monad subscriptions.
+Initialization makes one state call; operating updates make **zero read RPCs**.
+Requires a compatible **schema-6** deployment and Monad's ordered commitment stream.
 
 ## Install
 
-Use Rust **1.88 or newer**. For a new application, pin the release and enable
-Rust-version-aware dependency selection in `Cargo.toml`:
-
 ```toml
-[package]
-name = "thogamm-example"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.88"
-resolver = "3"
-
 [dependencies]
-event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.1.0" }
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
+event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.1.1" }
 ```
 
-Cargo uses the **consuming application's** resolver and lockfile; it does not
-inherit a Git dependency's lockfile or `.cargo/config.toml`. In an existing
-workspace, set `resolver = "3"` in its root `[workspace]` and declare the intended
-`rust-version` on the consuming package. This prevents fresh resolution from
-choosing newer transitive dependencies that require a newer compiler than the
-stated minimum. See [Cargo's Rust-version-aware resolver](https://doc.rust-lang.org/edition-guide/rust-2024/cargo-resolver.html).
-The SDK repository itself already includes the matching configuration and lockfile.
+Requires Rust 1.88+. In your application, declare `rust-version = "1.88"` and
+use Cargo resolver `"3"` (at the workspace root for a workspace). Commit your
+application's lockfile. The crate imports as `event_driven_sdk` and is distributed
+through GitHub. Its shared quote engine is pinned to the matching release of
+[thog-amm-poll-sdk](https://github.com/thogard785/thog-amm-poll-sdk).
 
-The GitHub repository is named `thog-amm-event-sdk`; the Rust crate remains `event-driven-sdk` and
-imports as `event_driven_sdk`. Git installation resolves the workspace package.
-Packages are distributed through GitHub, not crates.io. Commit your application's
-lockfile for reproducible dependencies. No private repository access is needed.
-
-The canonical model is in [thog-amm-poll-sdk](https://github.com/thogard785/thog-amm-poll-sdk/tree/v0.1.0/thogamm-model).
-The event SDK pins that public release instead of duplicating pricing code.
-Using both SDKs at matching tags resolves one shared model crate and compatible
-`PoolModel`, amount and error types.
-
-## Quickstart
-
-Clone this repository and set the following environment variables. Substitute
-your verified pool/token addresses and transaction context; the table does not
-advertise any default proxy as currently deployed and compatible.
-
-| Variable | Required value |
-| --- | --- |
-| `THOGAMM_HTTP_RPC` | Monad HTTP endpoint, used only for the single startup snapshot |
-| `THOGAMM_WS_RPC` | Monad WebSocket endpoint supporting the ordering and commitments in the transport guide |
-| `THOGAMM_PROXY` | Verified schema-6 pool proxy address |
-| `TOKEN_IN`, `TOKEN_OUT` | Listed ERC-20 token addresses |
-| `AMOUNT_IN` | Integer sell amount in raw token units; 1,000,000 is one token only when decimals = 6 |
-| `EFFECTIVE_GAS_PRICE_WEI` | Intended execution's effective transaction gas price, not its fee cap |
-| `FAST_LANE_HOT` | `true` or `false`, based on the actual execution context |
-
-```sh
-git clone https://github.com/thogard785/thog-amm-event-sdk.git
-cd thog-amm-event-sdk
-cargo run --locked -p event-driven-sdk --example execution-quotes
-```
-
-The example quotes the initial image, then each published update. It holds the
-supplied execution context fixed for demonstration; a router must supply the
-correct gas price and warmth for each intended transaction. Each update replaces
-the model atomically; unavailable quotes are reported with their source block.
-The program does not send a swap. The complete executable example is
-[`execution-quotes.rs`](event-driven-sdk/examples/execution-quotes.rs).
+## Subscribe and quote
 
 ```rust
-use event_driven_sdk::{Config, ExecutionContext, EventDrivenSdk, U256};
+use event_driven_sdk::{Config, EventDrivenSdk};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let sell = std::env::var("TOKEN_IN")?.parse()?;
-    let buy = std::env::var("TOKEN_OUT")?.parse()?;
-    let amount: U256 = std::env::var("AMOUNT_IN")?.parse()?;
-    let context = ExecutionContext {
-        gas_price: std::env::var("EFFECTIVE_GAS_PRICE_WEI")?.parse()?,
-        fast_lane_hot: std::env::var("FAST_LANE_HOT")?.parse()?,
-    };
-    let mut sdk = EventDrivenSdk::connect(
-        std::env::var("THOGAMM_HTTP_RPC")?,
-        std::env::var("THOGAMM_WS_RPC")?,
-        std::env::var("THOGAMM_PROXY")?.parse()?,
-        Config::default(),
-    )
-    .await?;
-
+async fn follow(
+    http_rpc: &str,
+    ws_rpc: &str,
+    proxy: event_driven_sdk::Address,
+) -> event_driven_sdk::Result<()> {
+    let mut sdk = EventDrivenSdk::connect(http_rpc, ws_rpc, proxy, Config::default()).await?;
+    // sdk.model() is ready to quote after initialization.
     loop {
+        let update = sdk.next_update().await?;
         let model = sdk.model();
-        match model.quote_execution_exact_input(sell, buy, amount, &context) {
-            Ok(quote) => println!(
-                "block={} amount_out={} last_posted_block={}",
-                model.state().block.number,
-                quote.amount_out,
-                quote.last_posted_block
-            ),
-            Err(error) => eprintln!("block={} unavailable={error}", model.state().block.number),
-        }
-        sdk.next_update().await?;
+        // Prepare directions and quote amounts against this immutable model.
+        println!("finalized block={} tokens={}", update.block.number, model.state().tokens.len());
     }
 }
 ```
 
-## Local quote surfaces
+Initialization registers four log filters and `monadNewHeads` on one socket,
+waits for an observed proposal to finalize, and makes one hash-pinned
+`getPoolData(0,64)` call. Notifications received during startup are retained.
+The seed must match the subscribed header and `Config.wmon`, which defaults to
+Monad mainnet WMON. The HTTP reader is then dropped.
 
-| API | Purpose |
-| --- | --- |
-| `quote_exact_input` | Match the read-only maker quote |
-| `quote_execution_exact_input` | Include execution friction and settlement exposure checks |
-| `quote_exact_output` | Solve the ERC-7815 Buy input with exact contract rounding |
-| `marginal_price` | Rational raw output/input price |
-| `limits` | Directional sell/buy bounds |
-| `prepare` | Reuse decoded pair math across an amount ladder |
-| `at_block` | Project aging/base-fee context while retaining source-state provenance |
+`next_update()` consumes pushed messages, orders/deduplicates overlapping filters,
+and publishes complete finalized ancestry atomically, including empty blocks.
+New listings carry metadata and absolute balances; they need no additional reads
+or subscriptions. Finalized state can trail the latest proposal. Every model
+retains its actual block number, hash and base fee.
 
-These methods are synchronous and perform no network I/O. Clone the immutable
-model to share a consistent snapshot across workers. Prepare each direction once
-per snapshot, then reuse it for many amounts. Quoting does not mutate balances or
-simulate successive fills; books share liquidity and portfolio risk.
+The provider must serialize a block's complete log notifications before the next
+header/commitment notification on that connection. Feed every commitment stage.
+Ordinary Ethereum `newHeads` plus logs does not establish completeness, and
+independently ordered sockets cannot be combined to infer it.
 
-## Update lifecycle
+## Quoting
 
-`EventDrivenSdk::connect` registers four log filters and `monadNewHeads` on one
-socket, waits for an observed proposal to finalize, and makes one hash-pinned
-state call. The reader is then dropped. `next_update()` consumes only pushed
-notifications, applies complete finalized ancestry atomically, and returns an
-`Update` with its block identity and the number of blocks applied.
+All quotes are synchronous local integer arithmetic over an immutable snapshot.
+Amounts are raw token units in `U256`; token addresses and decimals are in the
+model. Clone it to share a snapshot across workers, then call
+`model.prepare(sell, buy)` once and reuse the pair for multiple amounts.
 
-The provider must preserve Monad's per-connection header/log/commitment ordering.
-Ordinary Ethereum `newHeads` and logs alone do not prove a block's logs are complete.
-State is finalized, so it can trail the newest proposal. New token listings arrive
-through metadata/balance events without a reseed or resubscription.
+- `quote_exact_input` matches the read-only maker quote.
+- `quote_execution_exact_input` adds execution friction and exposure checks.
+- `quote_exact_output` solves the ERC-7815 Buy input.
+- `marginal_price` and `limits` expose price and directional capacity.
 
-For a caller-owned stream and finalized seed, `EventSynchronizer::from_model`
-performs no I/O; feed `on_head` and `on_log` in their original connection order.
-Disconnects, missing history, upgrades and malformed/accounting events are explicit
-errors. There is no automatic reconnect, catch-up query or snapshot fallback.
-See the [transport guide](docs/TRANSPORT.md) for initialization, failure handling
-and event-accounting requirements.
+Execution methods require `ExecutionContext { gas_price, fast_lane_hot }`:
+effective transaction gas price, not a fee cap, and actual transaction-local
+FastLane warmth. Pauses, stale prices and capacity limits produce errors.
+`at_block(number, base_fee)` projects aging without predicting intervening state.
+Balances and risk are shared across pairs; independent quotes do not simulate
+successive fills. Prepare again when selecting another snapshot or projection.
 
-## Documentation
+See the shared model's [quote and settlement instructions](https://github.com/thogard785/thog-amm-poll-sdk#quoting)
+for method semantics, direct swap encoding, funding and transaction constraints.
 
-- [Transport lifecycle and RPC contract](docs/TRANSPORT.md)
-- [Quote API, units, execution context and shared liquidity](docs/QUOTING.md)
-- [Settlement encoding and router responsibilities](docs/SETTLEMENT.md)
-- [Deployment and upgrade compatibility](docs/DEPLOYMENT.md)
-- [Troubleshooting](docs/TROUBLESHOOTING.md)
-- [CPU performance and benchmark methodology](docs/PERFORMANCE.md)
-- [Source and fixture provenance](docs/PROVENANCE.md)
-- [Release/version policy](docs/RELEASES.md), [changelog](CHANGELOG.md), and [contributing](CONTRIBUTING.md)
+## Caller-owned streams and failures
 
-Generate API documentation locally with `cargo doc --locked --workspace --no-deps --open`.
-Run all tests with `cargo test --locked --workspace --all-targets`; no live RPC
-access or funded wallet is needed by the tests. CI also runs release tests,
-formatting, Clippy, documentation builds, and fixture/link checks.
+`EventSynchronizer::from_model()` takes a validated finalized seed with a known
+block hash and performs no I/O. Supply `BlockHeader`, `CommitState` and `RpcLog`
+values through `on_head` and `on_log` in connection order. The stream must cover
+every successor. `model::events::log_filters(proxy, wmon)` supplies the log filters.
 
-## License
+Disconnects, missing history, malformed logs, inconsistent balances and upgrades
+return explicit errors and fail the stream. The last valid model keeps its old
+block stamp. There is no automatic reconnect, catch-up query or recovery snapshot.
+After resolving the cause, explicitly initialize another client or replay a
+complete persisted stream. `ContractUpgraded` requires a compatible model first.
 
-[MIT](LICENSE). Commercial use, modification and redistribution are permitted
-subject to retaining the license and copyright notice. Third-party dependencies
-retain their respective licenses. Repository issues are for SDK source support;
-coordinate production operation and upgrades through your deployment's contact.
+Balance changes must be observable through ERC-20 Transfer or the supported
+WETH9-style WMON events. Silent rebases cannot be inferred. With a custom startup
+`ChainReader`, preserve Monad's real BASEFEE using a nonzero simulation gas price
+(the built-in reader uses one wei). Startup requires EIP-1898 hash-pinned calls.
+
+## Example and tests
+
+Set `THOGAMM_HTTP_RPC`, `THOGAMM_WS_RPC`, `THOGAMM_PROXY`, `TOKEN_IN`, `TOKEN_OUT`,
+`AMOUNT_IN`, `EFFECTIVE_GAS_PRICE_WEI` and `FAST_LANE_HOT` (`true`/`false`):
+
+```sh
+cargo run --locked --example subscribe
+cargo test --locked --release --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+The example prints execution quotes with the supplied context; it submits no
+transactions. Tests use synthetic Solidity fixtures and a local WebSocket server
+and verify state transitions and zero operating read calls. No live network is
+required by the tests. Confirm contract/provider compatibility before routing.
+
+[MIT license](LICENSE).

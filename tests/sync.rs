@@ -1,4 +1,4 @@
-#[path = "../../fixtures/support.rs"]
+#[path = "common/mod.rs"]
 mod support;
 use alloy_sol_types::SolEvent;
 use event_driven_sdk::{CommitState as C, Config, EventDrivenSdk, EventSynchronizer};
