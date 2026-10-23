@@ -1,6 +1,6 @@
 //! Quote ThogAMM locally in your aggregator using state kept up to date by events.
 //! Connect once to load initial state; later updates consume subscriptions only.
-//! Published snapshots represent complete finalized blocks on Monad.
+//! Published snapshots represent complete finalized (default) or voted blocks on Monad.
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
@@ -23,14 +23,23 @@ pub struct Config {
     pub wmon: Address,
     /// Maximum wait for a complete new block; pings do not count as state progress.
     pub update_timeout: Duration,
+    /// Publish complete voted blocks earlier, or wait for finalization (default).
+    pub publish_at: PublishAt,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             wmon: alloy_primitives::address!("3bd359c1119da7da1d913d1c4d2b7c461115433a"),
             update_timeout: Duration::from_secs(2),
+            publish_at: PublishAt::Finalized,
         }
     }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PublishAt {
+    #[default]
+    Finalized,
+    Voted,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitState {
@@ -43,6 +52,7 @@ pub enum CommitState {
 pub struct Update {
     pub block: BlockHeader,
     pub blocks: u64,
+    pub commitment: CommitState,
     /// Local publication time; block.timestamp identifies queued historical updates.
     pub received_at: SystemTime,
 }
@@ -54,7 +64,8 @@ struct PendingBlock {
 
 /// An RPC-free reducer for one ordered Monad connection: four `logs` filters
 /// plus `monadNewHeads`. A subsequent commitment header closes the prior log
-/// frame. Only finalized ancestry is published; abandoned proposals are discarded.
+/// frame. The configured commitment selects when complete ancestry is published.
+/// Finalized mode discards abandoned proposals; voted mode reports divergent ancestry.
 /// Feed notifications in socket order, including Voted/Verified heads.
 ///
 /// The source must use Monad's header-before-logs, whole-block serialization
@@ -65,18 +76,31 @@ pub struct EventSynchronizer {
     pending: BTreeMap<B256, PendingBlock>,
     active: Option<B256>,
     failed: bool,
+    publish_at: PublishAt,
+    published: BTreeMap<u64, B256>,
 }
 impl EventSynchronizer {
     /// Use your own finalized pool snapshot and subsequent event stream.
     /// The snapshot must have its known block hash. This constructor performs no I/O.
     pub fn from_model(model: PoolModel) -> Result<Self> {
+        Self::from_model_with_commitment(model, PublishAt::Finalized)
+    }
+    /// Select finalized or voted publication from the same complete-block stream.
+    /// A voted ancestry conflict requires an explicit fresh snapshot.
+    pub fn from_model_with_commitment(model: PoolModel, publish_at: PublishAt) -> Result<Self> {
         if model.state().block.hash.is_none() {
             return Err(Error::InvalidData(
                 "event seed requires a known finalized block hash".into(),
             ));
         }
         model.state().validate()?;
+        let published = BTreeMap::from([(
+            model.state().block.number,
+            model.state().block.hash.unwrap(),
+        )]);
         Ok(Self {
+            publish_at,
+            published,
             model,
             pending: BTreeMap::new(),
             active: None,
@@ -157,11 +181,16 @@ impl EventSynchronizer {
         }
         let current = &self.model.state().block;
         if header.number <= current.number {
-            if commitment == CommitState::Finalized
-                && header.number == current.number
-                && Some(header.hash) != current.hash
+            if matches!(commitment, CommitState::Voted | CommitState::Finalized)
+                && self
+                    .published
+                    .get(&header.number)
+                    .is_some_and(|hash| *hash != header.hash)
             {
                 return Err(Error::Discontinuous);
+            }
+            if commitment == CommitState::Finalized {
+                self.published.retain(|number, _| *number >= header.number);
             }
             return Ok(None);
         }
@@ -183,7 +212,9 @@ impl EventSynchronizer {
             block.complete = false;
             return Ok(None);
         }
-        if commitment != CommitState::Finalized {
+        if commitment != CommitState::Finalized
+            && !(self.publish_at == PublishAt::Voted && commitment == CommitState::Voted)
+        {
             return Ok(None);
         }
         let mut path = Vec::new();
@@ -210,11 +241,19 @@ impl EventSynchronizer {
             next = apply_owned_block(next, block.header.clone(), block.logs.values())?;
         }
         let update = Update {
+            commitment,
             received_at: SystemTime::now(),
             blocks: header.number - current.number,
             block: header.clone(),
         };
         self.model = PoolModel::new(next)?;
+        for hash in &path {
+            self.published
+                .insert(self.pending[hash].header.number, *hash);
+        }
+        if commitment == CommitState::Finalized {
+            self.published.retain(|number, _| *number >= header.number);
+        }
         self.pending
             .retain(|_, block| block.header.number > header.number);
         Ok(Some(update))
@@ -305,7 +344,7 @@ impl EventDrivenSdk {
             ));
         }
         Ok(Self {
-            synchronizer: EventSynchronizer::from_model(model)?,
+            synchronizer: EventSynchronizer::from_model_with_commitment(model, config.publish_at)?,
             socket,
             subscriptions,
             queued,

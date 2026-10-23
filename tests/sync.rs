@@ -404,3 +404,53 @@ fn updates_expose_the_block_time_independently_of_local_publication_time() {
     assert_eq!(update.block.timestamp, U256::from(1_700_000_000));
     assert!(update.received_at >= before);
 }
+
+#[test]
+fn voted_mode_publishes_complete_state_before_later_finalization() {
+    use event_driven_sdk::PublishAt;
+    let f = support::fixture();
+    let seed = support::model(f.proxy, f.baseFee, &f.events[0].beforeState);
+    let mut previous = support::model_header(&seed);
+    let mut sdk = EventSynchronizer::from_model_with_commitment(seed, PublishAt::Voted).unwrap();
+    for e in &f.events {
+        let expected = support::model(f.proxy, f.baseFee, &e.afterState);
+        let h = support::model_header(&expected);
+        let before = sdk.model().unwrap().state().clone();
+        sdk.on_head(h.clone(), C::Proposed).unwrap();
+        for log in support::logs(e, f.baseFee).into_iter().rev() {
+            sdk.on_log(log).unwrap();
+        }
+        assert_eq!(sdk.model().unwrap().state(), &before);
+        let update = sdk.on_head(h.clone(), C::Voted).unwrap().unwrap();
+        assert_eq!(update.commitment, C::Voted);
+        assert_eq!(sdk.model().unwrap().state(), expected.state());
+        assert!(sdk.on_head(previous, C::Finalized).unwrap().is_none());
+        assert_eq!(sdk.model().unwrap().state(), expected.state());
+        previous = h;
+    }
+    assert!(sdk.on_head(previous, C::Finalized).unwrap().is_none());
+}
+
+#[test]
+fn a_conflicting_finalized_ancestor_invalidates_the_voted_model() {
+    use event_driven_sdk::PublishAt;
+    let f = support::fixture();
+    let seed = support::model(f.proxy, f.baseFee, &f.events[0].beforeState);
+    let mut sdk = EventSynchronizer::from_model_with_commitment(seed, PublishAt::Voted).unwrap();
+    for e in f.events.iter().take(2) {
+        let h = support::model_header(&support::model(f.proxy, f.baseFee, &e.afterState));
+        sdk.on_head(h.clone(), C::Proposed).unwrap();
+        for l in support::logs(e, f.baseFee) {
+            sdk.on_log(l).unwrap();
+        }
+        sdk.on_head(h, C::Voted).unwrap().unwrap();
+    }
+    let mut conflicting =
+        support::model_header(&support::model(f.proxy, f.baseFee, &f.events[0].afterState));
+    conflicting.hash = support::hash(conflicting.number, 99);
+    assert!(matches!(
+        sdk.on_head(conflicting, C::Finalized),
+        Err(Error::Discontinuous)
+    ));
+    assert!(matches!(sdk.model(), Err(Error::SnapshotUnavailable)));
+}

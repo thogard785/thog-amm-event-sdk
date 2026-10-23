@@ -55,10 +55,17 @@ async fn follow_quotes(
 
 `connect()` opens subscriptions and loads the initial state with one
 `getPoolData(0, 32)` call. `next_update()` consumes subscription messages and
-publishes a complete finalized snapshot, including blocks without trades.
+publishes a complete finalized snapshot by default, including blocks without trades.
 There are no polling, log-history, balance or token-discovery reads while running.
 
-Finalized state may trail the latest proposed block. Use
+For earlier complete state, set `Config { publish_at: PublishAt::Voted,
+..Config::default() }` (import `event_driven_sdk::PublishAt`). This publishes
+when the voted header closes a fully received proposal's logs. It never publishes
+an incomplete proposal. A voted ancestry conflict is reported and requires a new
+snapshot. Finalized mode remains the default. The provider ordering is defined
+by Monad's [WebSocket handler](https://github.com/category-labs/monad-bft/blob/4f40dca998738bcd2a504b4c86b26475afb72c12/monad-rpc/src/websocket/handler.rs).
+
+Finalized state may trail the latest voted block. Use
 `model.state().block.number` and `.hash` to identify the quoted state;
 `model.state().tokens` provides listed token addresses and decimals. Keep calling
 `next_update()` to process incoming messages. Quote methods are synchronous and
@@ -132,7 +139,9 @@ those changes. The SDK does not perform hidden recovery reads.
 
 `EventSynchronizer::from_model()` accepts a finalized snapshot with a known block
 hash and performs no I/O. Pass `BlockHeader`, `CommitState` and `RpcLog` values to
-`on_head` and `on_log`. `model::events::log_filters(pool, wmon)` provides the filters.
+`on_head` and `on_log`. `from_model_with_commitment(model, PublishAt::Voted)`
+selects earlier publication for your own stream.
+`model::events::log_filters(pool, wmon)` provides the filters.
 
 Use one ordered Monad connection and pass every header commitment stage and log
 in received order. The provider must finish a block's logs before its next header
