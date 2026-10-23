@@ -99,6 +99,7 @@ pub fn hash(number: u64, branch: u8) -> B256 {
 }
 pub fn header(number: u64, base_fee: U256) -> BlockHeader {
     BlockHeader {
+        timestamp: U256::ZERO,
         number,
         hash: hash(number, 0),
         parent_hash: hash(number - 1, 0),

@@ -20,9 +20,8 @@ replacement state, since those events omit policy rows required for pricing.
 event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.3.0" }
 ```
 
-Requires Rust 1.88 or later and Tokio for subscriptions. Set your application's
-`rust-version` and use Cargo resolver `"3"` at the package or workspace root so
-dependencies respect that Rust version. Commit your application's `Cargo.lock`.
+Requires Rust 1.88 or later and Tokio for subscriptions. Both Cargo resolvers 2 and 3 are supported. Commit your application's
+`Cargo.lock`. The shared model dependency is pinned to an immutable Git revision.
 Import the crate as `event_driven_sdk`.
 
 ## Connect once, then quote locally

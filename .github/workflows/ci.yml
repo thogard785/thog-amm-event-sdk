@@ -27,3 +27,21 @@ jobs:
           cargo fmt --all -- --check
           cargo test --locked --release --all-targets
           cargo clippy --locked --all-targets -- -D warnings
+      - name: Build fresh resolver-2 consumer on the minimum Rust version
+        shell: bash
+        run: |
+          consumer_dir=$(mktemp -d)
+          mkdir "$consumer_dir/src"
+          cat > "$consumer_dir/Cargo.toml" <<EOF
+          [package]
+          name = "event-sdk-consumer"
+          version = "0.0.0"
+          edition = "2021"
+          rust-version = "1.88"
+          resolver = "2"
+          [dependencies]
+          event-driven-sdk = { path = "$GITHUB_WORKSPACE" }
+          alloy-primitives = "=1.7.2"
+          EOF
+          echo 'fn main() { let _: event_driven_sdk::U256 = alloy_primitives::U256::ZERO; }' > "$consumer_dir/src/main.rs"
+          cargo check --manifest-path "$consumer_dir/Cargo.toml"

@@ -2348,12 +2348,13 @@ dependencies = [
 [[package]]
 name = "thogamm-model"
 version = "0.3.0"
-source = "git+https://github.com/thogard785/thog-amm-poll-sdk?tag=v0.3.0#11635f1df026c1e0ec9dde821546f0fe4729b8bf"
+source = "git+https://github.com/thogard785/thog-amm-poll-sdk?rev=63107574fbc3b4e369782e5b25a0315f23061f98#63107574fbc3b4e369782e5b25a0315f23061f98"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "async-trait",
  "reqwest",
+ "ruint",
  "serde",
  "serde_json",
  "thiserror",
