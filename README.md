@@ -204,5 +204,6 @@ queries, 1,680 execution/exact-output calls on a local Monad fork, and 5,544
 fork boundary cases. All 5,362 successful results match exactly; all 3,878
 rejected cases also reject locally. Event replay matches 200 consecutive
 mainnet snapshots, including every word, ERC-20 balance and native balance.
+Separate mainnet fixtures cover lending exposure and pause/unpause transitions.
 Run `cargo test --locked` (or `cargo test --workspace --locked` in the polling
 repository). Fork tests do not broadcast transactions.
