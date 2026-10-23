@@ -17,9 +17,10 @@ replacement state, since those events omit policy rows required for pricing.
 
 ```toml
 [dependencies]
-event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.3.0" }
+event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", rev = "a4f5398106b7906bd301eb009b576d9095f4d775" }
 ```
 
+This review revision builds on v0.3.0; use the pinned revision for the API shown below.
 Requires Rust 1.88 or later and Tokio for subscriptions. Both Cargo resolvers 2 and 3 are supported. Commit your application's
 `Cargo.lock`. The shared model dependency is pinned to an immutable Git revision.
 Import the crate as `event_driven_sdk`.
