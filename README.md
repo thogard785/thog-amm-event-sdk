@@ -147,9 +147,11 @@ these errors instead of silently making recovery reads. `sdk.model()` returns an
 cloned model keeps its original block stamp. Quote errors such as a stale price or unavailable
 pair do not stop the subscription; keep processing updates.
 
-If the registry changes, reconnect and rebuild all prepared pairs. If the SDK
-reports an unsupported state format or a contract upgrade, verify compatibility
-and use the matching release before reconnecting.
+If the registry changes, reconnect and rebuild all prepared pairs. An upgrade
+also requires a complete post-upgrade snapshot: reconnect validates its schema,
+wire and model versions. A same-version upgrade can resume with this SDK; only
+an unsupported format requires a matching release. The upgrade event alone
+cannot establish that the previous state is still complete.
 
 Event completeness assumes the supported tokens emit their ordinary balance
 movements and native MON follows the executor’s checkpointed paths. Forced
