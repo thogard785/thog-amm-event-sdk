@@ -4,9 +4,9 @@ A Rust SDK for aggregators integrating ThogAMM on Monad. Load pool state once,
 then keep an in-memory quote model up to date through event subscriptions.
 **Updates after initialization make zero read RPC calls.**
 
-It works with the current ThogAMM deployment and automatically supports all
-current and future tokens listed on ThogAMM. New listings, balances and pricing
-updates arrive through the subscribed events.
+It supports the deployed schema-7 registry and policy events. A listing or
+retirement returns `Error::RegistryChanged`: reconnect to obtain the complete
+replacement state, since those events omit policy rows required for pricing.
 
 - **Network:** Monad mainnet, chain ID `143`
 - **ThogAMM pool:** `0x80c74517BCC2D67fFE02D3ED886796272F647210`
@@ -17,7 +17,7 @@ updates arrive through the subscribed events.
 
 ```toml
 [dependencies]
-event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.2.0" }
+event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.3.0" }
 ```
 
 Requires Rust 1.88 or later and Tokio for subscriptions. Set your application's
@@ -55,7 +55,7 @@ async fn follow_quotes(
 ```
 
 `connect()` opens subscriptions and loads the initial state with one
-`getPoolData(0, 64)` call. `next_update()` consumes subscription messages and
+`getPoolData(0, 32)` call. `next_update()` consumes subscription messages and
 publishes a complete finalized snapshot, including blocks without trades.
 There are no polling, log-history, balance or token-discovery reads while running.
 
@@ -70,11 +70,17 @@ make no network calls.
 Amounts are `U256` values in raw token units: one token with six decimals is
 `1_000_000`. `gas_price` is the intended transaction's effective price in wei;
 for EIP-1559, use `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`.
-The model includes additional spread if that price exceeds twice the block base fee.
+Execution applies one 10 bp output reduction if that price exceeds twice the
+quote block base fee or the AuctionHandler is already warm. The convenience
+methods below assume a cold AuctionHandler. Use
+`quote_execution_exact_input_with_context(..., gas_price, auction_handler_warm)`
+and `quote_exact_output_with_context(...)` to specify account warmth explicitly.
+`quote_exact_input(...)` matches `makerQuoteExactInput` with its strict 90%
+receiving-inventory caps and no execution widening. Execution checks full caps.
 
 | Method on `PoolModel` | Result |
 | --- | --- |
-| `quote_execution_exact_input(token_in, token_out, amount_in, gas_price)` | Output amount, including balance and exposure checks |
+| `quote_execution_exact_input(token_in, token_out, amount_in, gas_price)` | Output amount, including final full-cap checks; cold AuctionHandler |
 | `quote_exact_output(token_in, token_out, amount_out, gas_price)` | Required input for an exact output amount |
 | `limits(token_in, token_out)` | Directional input and output bounds |
 | `marginal_price(token_in, token_out, amount_in)` | A fraction expressing raw output units per raw input unit |
@@ -109,8 +115,15 @@ these errors instead of silently making recovery reads. The last valid snapshot
 keeps its original block stamp. Quote errors such as a stale price or unavailable
 pair do not stop the subscription; keep processing updates.
 
-If the SDK reports an unsupported state format or a contract upgrade, use the
-SDK release supplied by ThogAMM for that update.
+If the registry changes, reconnect and rebuild all prepared pairs. If the SDK
+reports an unsupported state format or a contract upgrade, verify compatibility
+and use the matching release before reconnecting.
+
+Event completeness assumes the supported tokens emit their ordinary balance
+movements and native MON follows the executor’s checkpointed paths. Forced
+native transfers or tokens that change balances without events require account
+state updates or a fresh atomic snapshot; log subscriptions alone cannot prove
+those changes. The SDK does not perform hidden recovery reads.
 
 ## Use your own event stream
 
@@ -136,3 +149,24 @@ cargo run --locked --example subscribe
 quotes. For integrations that already schedule their own state reads, the
 [polling SDK](https://github.com/thogard785/thog-amm-poll-sdk) offers the same quote
 model with one `eth_call` per refresh. Both SDKs are [MIT licensed](LICENSE).
+
+## Schema 7 and verification
+
+Version **0.3.0** supports schema 7 / wire 7 / model 1 and up to 32 active
+tokens. It replaces the incompatible schema-6 model. State includes all 126
+words, all registered ERC-20 balances, native MON, lending exposure offsets,
+separate bid/ask widths, volume charges, wrapper policies and inventory caps.
+
+Volume cost is `ceil(rate * notionalUSDWad² / 1e27)` and remains payable for
+risk-reducing trades, same-category trades and zero lambda. Sliding output
+refunds participate in the nonlinear output solve with exact integer rounding.
+
+The [integration guide](https://github.com/thogard785/thog-amm-integration-guide)
+contains the full ABI, state layout, math, settlement rules and reproducible
+fixtures. Tests cover **9,240 contract comparisons**: 2,016 mainnet read-only
+queries, 1,680 execution/exact-output calls on a local Monad fork, and 5,544
+fork boundary cases. All 5,362 successful results match exactly; all 3,878
+rejected cases also reject locally. Event replay matches 200 consecutive
+mainnet snapshots, including every word, ERC-20 balance and native balance.
+Run `cargo test --locked` (or `cargo test --workspace --locked` in the polling
+repository). Fork tests do not broadcast transactions.

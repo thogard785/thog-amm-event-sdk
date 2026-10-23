@@ -9,7 +9,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[test]
-fn subscription_logs_reproduce_every_contract_checkpoint_including_prefunded_listing() {
+fn subscription_logs_reproduce_two_hundred_deployed_checkpoints() {
     let f = support::fixture();
     let seed = support::model(f.proxy, f.baseFee, &f.events[0].beforeState);
     let mut sdk = EventSynchronizer::from_model(seed).unwrap();
@@ -31,8 +31,8 @@ fn subscription_logs_reproduce_every_contract_checkpoint_including_prefunded_lis
         assert_eq!(sdk.model().state(), expected.state());
         assert!(sdk.on_head(h, C::Verified).unwrap().is_none());
     }
-    assert_eq!(sdk.model().max_index(), 17);
-    assert!(!sdk.model().state().balances[16].is_zero());
+    assert_eq!(sdk.model().max_index(), 7);
+    assert!(!sdk.model().state().balances[0].is_zero());
 }
 #[test]
 fn repeated_proposal_frames_do_not_apply_balance_deltas_twice() {
@@ -284,4 +284,37 @@ async fn websocket_updates_issue_zero_rpc_reads_and_only_one_startup_snapshot() 
     })
     .await
     .unwrap();
+}
+
+#[test]
+fn registry_retirement_requires_an_explicit_complete_snapshot() {
+    let f = support::fixture();
+    let seed = support::model(f.proxy, f.baseFee, &f.events[0].beforeState);
+    let before = seed.state().clone();
+    let h = support::header(before.block.number + 1, f.baseFee);
+    let mut sdk = EventSynchronizer::from_model(seed).unwrap();
+    sdk.on_head(h.clone(), C::Proposed).unwrap();
+    let event = abi::MakerTokenRetired {
+        retiredIndex: 1,
+        token: before.tokens[1].token,
+        movedFrom: 7,
+        generation: 2,
+    }
+    .encode_log_data();
+    sdk.on_log(RpcLog {
+        address: f.proxy,
+        topics: event.topics().to_vec(),
+        data: event.data,
+        block_hash: h.hash,
+        block_number: h.number,
+        transaction_index: 0,
+        log_index: 0,
+        removed: false,
+    })
+    .unwrap();
+    assert!(matches!(
+        sdk.on_head(h, C::Finalized),
+        Err(Error::RegistryChanged)
+    ));
+    assert_eq!(sdk.model().state(), &before);
 }

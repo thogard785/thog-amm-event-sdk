@@ -274,7 +274,9 @@ impl EventDrivenSdk {
         .await
         .map_err(|_| Error::Transport("no finalized subscription checkpoint received".into()))??;
         let model = snapshot(&reader, proxy, CallBlock::Hash(seed_header.hash)).await?;
-        if model.state().block != seed_header.into() || model.state().tokens[3].token != config.wmon
+        if model.state().block != seed_header.into()
+            || config.wmon != thogamm_model::state::WMON
+            || !model.state().tokens.iter().any(|t| t.token == config.wmon)
         {
             return Err(Error::InvalidData(
                 "seed disagrees with subscription context or WMON configuration".into(),

@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use alloy_sol_types::{sol, SolCall, SolValue};
+use alloy_sol_types::{sol, SolCall};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -17,11 +17,76 @@ sol! {
 }
 pub fn fixture() -> Fixture {
     use std::io::Read;
-    let mut data = Vec::new();
-    flate2::read::GzDecoder::new(&include_bytes!("contract.bin.gz")[..])
-        .read_to_end(&mut data)
-        .unwrap();
-    Fixture::abi_decode_validate(&data).unwrap()
+    let read = |data: &[u8]| {
+        let mut bytes = Vec::new();
+        flate2::read::GzDecoder::new(data)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let quotes = read(include_bytes!("deployed-v7.json.gz"));
+    let events = read(include_bytes!("events-v7.json.gz"));
+    let normalize = |encoded: &serde_json::Value| {
+        let bytes: Bytes = encoded.as_str().unwrap().parse().unwrap();
+        let mut p = page(&bytes);
+        p.parentBlockHash = hash(p.blockNumber.to::<u64>() - 1, 0);
+        Bytes::from(abi::getPoolDataCall::abi_encode_returns(&p))
+    };
+    let blocks = events["blocks"].as_array().unwrap();
+    Fixture {
+        proxy: quotes["proxy"].as_str().unwrap().parse().unwrap(),
+        baseFee: quotes["snapshots"][0]["baseFeePerGas"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+        samples: quotes["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| SampleSet {
+                snapshot: normalize(&b["snapshot"]),
+                quotes: b["cases"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| Sample {
+                        kind: match c["method"].as_str().unwrap() {
+                            "quote" => 0,
+                            "price" => 1,
+                            "limits" => 2,
+                            _ => unreachable!(),
+                        },
+                        inputIndex: c["inputIndex"].as_u64().unwrap() as u8,
+                        outputIndex: c["outputIndex"].as_u64().unwrap() as u8,
+                        amount: c["amount"].as_str().unwrap().parse().unwrap(),
+                        gasPrice: U256::ZERO,
+                        fastLaneHot: false,
+                        success: c["success"].as_bool().unwrap(),
+                        result: c["result"].as_str().unwrap_or("0x").parse().unwrap(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        events: blocks
+            .windows(2)
+            .map(|pair| EventSet {
+                beforeState: normalize(&pair[0]["snapshot"]),
+                afterState: normalize(&pair[1]["snapshot"]),
+                logs: pair[1]["logs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|l| CapturedLog {
+                        emitter: l["address"].as_str().unwrap().parse().unwrap(),
+                        data: l["data"].as_str().unwrap().parse().unwrap(),
+                        topics: serde_json::from_value(l["topics"].clone()).unwrap(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        singleTokenPages: Vec::new(),
+    }
 }
 pub fn page(bytes: &Bytes) -> abi::PoolData {
     abi::getPoolDataCall::abi_decode_returns_validate(bytes).unwrap()
@@ -116,7 +181,7 @@ impl thogamm_model::rpc::ChainReader for MockRpc {
         };
         let p = c.states[&hash].clone();
         let call = abi::getPoolDataCall::abi_decode_validate(&data).unwrap();
-        assert_eq!((call.startTokenIndex, call.stopTokenIndex), (0, 64));
+        assert_eq!((call.startTokenIndex, call.stopTokenIndex), (0, 32));
         Ok(abi::getPoolDataCall::abi_encode_returns(&p).into())
     }
 }
