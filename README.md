@@ -43,7 +43,7 @@ async fn follow_quotes(
 ) -> Result<()> {
     let mut sdk = EventDrivenSdk::connect(http_rpc, ws_rpc, pool, Config::default()).await?;
     loop {
-        let model = sdk.model();
+        let model = sdk.model()?;
         match model.quote_execution_exact_input(token_in, token_out, amount_in, gas_price) {
             Ok(quote) => println!("amount_out={}", quote.amount_out),
             Err(error) => eprintln!("quote unavailable: {error}"),
@@ -62,7 +62,11 @@ Finalized state may trail the latest proposed block. Use
 `model.state().block.number` and `.hash` to identify the quoted state;
 `model.state().tokens` provides listed token addresses and decimals. Keep calling
 `next_update()` to process incoming messages. Quote methods are synchronous and
-make no network calls.
+make no network calls. `Update.block.timestamp` is the chain timestamp (Unix
+seconds); `Update.received_at` is the local publication time. Compare the block
+number with your head and use the timestamp to identify a queued old update.
+`Config::update_timeout` defaults to 2 seconds without a complete new block;
+the client sends idle WebSocket pings, but pongs do not extend that deadline.
 
 ## Quote trade sizes
 
@@ -110,8 +114,8 @@ simulate successive fills. For swap encoding and settlement, see the shared
 
 If `next_update()` reports a disconnect or missing events, create a new client
 with `connect()` to load current state and resume subscriptions. The SDK reports
-these errors instead of silently making recovery reads. The last valid snapshot
-keeps its original block stamp. Quote errors such as a stale price or unavailable
+these errors instead of silently making recovery reads. `sdk.model()` returns an error after a failed or cancelled update. A previously
+cloned model keeps its original block stamp. Quote errors such as a stale price or unavailable
 pair do not stop the subscription; keep processing updates.
 
 If the registry changes, reconnect and rebuild all prepared pairs. If the SDK

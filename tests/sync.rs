@@ -16,23 +16,23 @@ fn subscription_logs_reproduce_two_hundred_deployed_checkpoints() {
     for e in &f.events {
         let expected = support::model(f.proxy, f.baseFee, &e.afterState);
         let h = support::model_header(&expected);
-        let previous = sdk.model().state().clone();
+        let previous = sdk.model().unwrap().state().clone();
         assert!(sdk.on_head(h.clone(), C::Proposed).unwrap().is_none());
         // Separate filters are delivered in groups, not global log order.
         for log in support::logs(e, f.baseFee).into_iter().rev() {
             sdk.on_log(log.clone()).unwrap();
             sdk.on_log(log).unwrap(); // Overlapping filters must deduplicate.
         }
-        assert_eq!(sdk.model().state(), &previous);
+        assert_eq!(sdk.model().unwrap().state(), &previous);
         assert!(sdk.on_head(h.clone(), C::Voted).unwrap().is_none());
-        assert_eq!(sdk.model().state(), &previous);
+        assert_eq!(sdk.model().unwrap().state(), &previous);
         let update = sdk.on_head(h.clone(), C::Finalized).unwrap().unwrap();
         assert_eq!(update.blocks, 1);
-        assert_eq!(sdk.model().state(), expected.state());
+        assert_eq!(sdk.model().unwrap().state(), expected.state());
         assert!(sdk.on_head(h, C::Verified).unwrap().is_none());
     }
-    assert_eq!(sdk.model().max_index(), 7);
-    assert!(!sdk.model().state().balances[0].is_zero());
+    assert_eq!(sdk.model().unwrap().max_index(), 7);
+    assert!(!sdk.model().unwrap().state().balances[0].is_zero());
 }
 #[test]
 fn repeated_proposal_frames_do_not_apply_balance_deltas_twice() {
@@ -49,7 +49,7 @@ fn repeated_proposal_frames_do_not_apply_balance_deltas_twice() {
         }
     }
     sdk.on_head(header, C::Finalized).unwrap().unwrap();
-    assert_eq!(sdk.model().state(), expected.state());
+    assert_eq!(sdk.model().unwrap().state(), expected.state());
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn skipped_intermediate_commitments_and_multiple_pending_blocks_need_no_reads() 
         .unwrap()
         .unwrap();
     assert_eq!(update.blocks, 3);
-    assert_eq!(sdk.model().state(), expected.state());
+    assert_eq!(sdk.model().unwrap().state(), expected.state());
 }
 #[test]
 fn abandoned_proposals_never_change_the_finalized_model() {
@@ -95,7 +95,7 @@ fn abandoned_proposals_never_change_the_finalized_model() {
         .unwrap();
     let mut expected = seed.into_state();
     expected.block = canonical.into();
-    assert_eq!(sdk.model().state(), &expected);
+    assert_eq!(sdk.model().unwrap().state(), &expected);
 }
 #[test]
 fn missing_proposal_is_reported_without_inventing_an_empty_block() {
@@ -108,7 +108,7 @@ fn missing_proposal_is_reported_without_inventing_an_empty_block() {
         sdk.on_head(h.clone(), C::Finalized),
         Err(Error::Discontinuous)
     ));
-    assert_eq!(sdk.model().state(), &previous);
+    assert!(matches!(sdk.model(), Err(Error::SnapshotUnavailable)));
     assert!(sdk.on_head(h, C::Proposed).is_err());
 }
 #[test]
@@ -147,7 +147,7 @@ fn malformed_logs_and_balance_mismatches_are_atomic_errors_without_reseed() {
         } else {
             matches!(err, Error::Abi(_))
         });
-        assert_eq!(sdk.model().state(), &previous);
+        assert!(matches!(sdk.model(), Err(Error::SnapshotUnavailable)));
     }
 }
 #[test]
@@ -264,6 +264,7 @@ async fn websocket_updates_issue_zero_rpc_reads_and_only_one_startup_snapshot() 
             f.proxy,
             Config {
                 wmon: seed.state().tokens[3].token,
+                ..Config::default()
             },
         )
         .await
@@ -275,7 +276,7 @@ async fn websocket_updates_issue_zero_rpc_reads_and_only_one_startup_snapshot() 
         for e in &f.events {
             sdk.next_update().await.unwrap();
             let expected: PoolModel = support::model(f.proxy, f.baseFee, &e.afterState);
-            assert_eq!(sdk.model().state(), expected.state());
+            assert_eq!(sdk.model().unwrap().state(), expected.state());
             assert_eq!(rpc.call_count(), 1);
         }
         assert!(sdk.next_update().await.is_err());
@@ -316,5 +317,90 @@ fn registry_retirement_requires_an_explicit_complete_snapshot() {
         sdk.on_head(h, C::Finalized),
         Err(Error::RegistryChanged)
     ));
-    assert_eq!(sdk.model().state(), &before);
+    assert!(matches!(sdk.model(), Err(Error::SnapshotUnavailable)));
+}
+
+#[tokio::test]
+async fn a_live_socket_without_new_blocks_times_out_even_when_pongs_arrive() {
+    use std::time::Duration;
+    let f = support::fixture();
+    let rpc = support::MockRpc::from_events(&f);
+    let seed = support::model(f.proxy, f.baseFee, &f.events[0].beforeState);
+    let seed_head = support::model_header(&seed);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (done, finish) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        for i in 1..=5 {
+            let req: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(req["method"], "eth_subscribe");
+            socket
+                .send(Message::Text(
+                    json!({"jsonrpc":"2.0","id":i,"result":format!("sub{i}")})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        for stage in ["Proposed", "Finalized"] {
+            socket
+                .send(Message::Text(head(&seed_head, stage).to_string().into()))
+                .await
+                .unwrap();
+        }
+        // No state messages follow. Keep the transport alive by answering the client's ping.
+        let Message::Ping(payload) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected client ping")
+        };
+        socket.send(Message::Pong(payload)).await.unwrap();
+        finish.await.unwrap();
+    });
+    let mut sdk = EventDrivenSdk::with_reader(
+        rpc.clone(),
+        url,
+        f.proxy,
+        Config {
+            update_timeout: Duration::from_millis(1200),
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+    let historical = sdk.model().unwrap().clone();
+    // Cancellation also invalidates live access; no subsequent reader can mistake it for a fresh update.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), sdk.next_update())
+            .await
+            .is_err()
+    );
+    assert!(matches!(sdk.model(), Err(Error::SnapshotUnavailable)));
+    assert!(matches!(sdk.next_update().await, Err(Error::Transport(_))));
+    assert!(matches!(sdk.model(), Err(Error::SnapshotUnavailable)));
+    assert_eq!(historical.state(), seed.state());
+    assert_eq!(rpc.call_count(), 1);
+    done.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[test]
+fn updates_expose_the_block_time_independently_of_local_publication_time() {
+    let f = support::fixture();
+    let e = &f.events[0];
+    let mut sdk =
+        EventSynchronizer::from_model(support::model(f.proxy, f.baseFee, &e.beforeState)).unwrap();
+    let mut h = support::model_header(&support::model(f.proxy, f.baseFee, &e.afterState));
+    h.timestamp = U256::from(1_700_000_000);
+    sdk.on_head(h.clone(), C::Proposed).unwrap();
+    for l in support::logs(e, f.baseFee) {
+        sdk.on_log(l).unwrap();
+    }
+    let before = std::time::SystemTime::now();
+    let update = sdk.on_head(h, C::Finalized).unwrap().unwrap();
+    assert_eq!(update.block.timestamp, U256::from(1_700_000_000));
+    assert!(update.received_at >= before);
 }

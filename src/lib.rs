@@ -3,7 +3,10 @@
 //! Published snapshots represent complete finalized blocks on Monad.
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::collections::{btree_map::Entry, BTreeMap, VecDeque};
+use std::{
+    collections::{btree_map::Entry, BTreeMap, VecDeque},
+    time::{Duration, SystemTime},
+};
 pub use thogamm_model::{self as model, Address, Error, PoolModel, Result, U256};
 use thogamm_model::{
     events::{apply_owned_block, log_filters},
@@ -18,11 +21,14 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub struct Config {
     /// Wrapped MON token used to track pool balances. Defaults to Monad mainnet WMON.
     pub wmon: Address,
+    /// Maximum wait for a complete new block; pings do not count as state progress.
+    pub update_timeout: Duration,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             wmon: alloy_primitives::address!("3bd359c1119da7da1d913d1c4d2b7c461115433a"),
+            update_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -37,6 +43,8 @@ pub enum CommitState {
 pub struct Update {
     pub block: BlockHeader,
     pub blocks: u64,
+    /// Local publication time; block.timestamp identifies queued historical updates.
+    pub received_at: SystemTime,
 }
 struct PendingBlock {
     header: BlockHeader,
@@ -75,8 +83,11 @@ impl EventSynchronizer {
             failed: false,
         })
     }
-    pub fn model(&self) -> &PoolModel {
-        &self.model
+    pub fn model(&self) -> Result<&PoolModel> {
+        if self.failed {
+            return Err(Error::SnapshotUnavailable);
+        }
+        Ok(&self.model)
     }
     pub fn on_log(&mut self, log: RpcLog) -> Result<()> {
         if self.failed {
@@ -199,6 +210,7 @@ impl EventSynchronizer {
             next = apply_owned_block(next, block.header.clone(), block.logs.values())?;
         }
         let update = Update {
+            received_at: SystemTime::now(),
             blocks: header.number - current.number,
             block: header.clone(),
         };
@@ -223,6 +235,8 @@ pub struct EventDrivenSdk {
     socket: Socket,
     subscriptions: Subscriptions,
     queued: VecDeque<Value>,
+    config: Config,
+    ready: bool,
 }
 impl EventDrivenSdk {
     /// Connect using Monad HTTP/WebSocket endpoints and the ThogAMM pool address.
@@ -243,6 +257,9 @@ impl EventDrivenSdk {
         proxy: Address,
         config: Config,
     ) -> Result<Self> {
+        if config.update_timeout.is_zero() {
+            return Err(Error::InvalidData("update timeout must be positive".into()));
+        }
         let (mut socket, subscriptions, mut queued) = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             subscribe(ws_url.as_ref(), proxy, config.wmon),
@@ -273,7 +290,12 @@ impl EventDrivenSdk {
         })
         .await
         .map_err(|_| Error::Transport("no finalized subscription checkpoint received".into()))??;
-        let model = snapshot(&reader, proxy, CallBlock::Hash(seed_header.hash)).await?;
+        let model = tokio::time::timeout(
+            config.update_timeout,
+            snapshot(&reader, proxy, CallBlock::Hash(seed_header.hash)),
+        )
+        .await
+        .map_err(|_| Error::Transport("initial snapshot timed out".into()))??;
         if model.state().block != seed_header.into()
             || config.wmon != thogamm_model::state::WMON
             || !model.state().tokens.iter().any(|t| t.token == config.wmon)
@@ -287,9 +309,16 @@ impl EventDrivenSdk {
             socket,
             subscriptions,
             queued,
+            config,
+            ready: true,
         })
     }
-    pub fn model(&self) -> &PoolModel {
+    /// Live access is unavailable after a failed or cancelled update. A clone
+    /// retained by the caller still describes its original historical block.
+    pub fn model(&self) -> Result<&PoolModel> {
+        if !self.ready {
+            return Err(Error::SnapshotUnavailable);
+        }
         self.synchronizer.model()
     }
     /// Reads pushed messages only. A lost connection, missing block, incompatible
@@ -298,7 +327,12 @@ impl EventDrivenSdk {
         if self.synchronizer.failed {
             return Err(Error::Discontinuous);
         }
-        let result = self.read_update().await;
+        self.ready = false;
+        let result = tokio::time::timeout(self.config.update_timeout, self.read_update())
+            .await
+            .map_err(|_| Error::Transport("no complete block before subscription deadline".into()))
+            .and_then(|r| r);
+        self.ready = result.is_ok();
         if result.is_err() {
             self.synchronizer.failed = true;
         }
@@ -412,7 +446,17 @@ async fn subscribe(
 }
 async fn read_json(socket: &mut Socket) -> Result<Value> {
     loop {
-        match socket.next().await {
+        let message = match tokio::time::timeout(Duration::from_secs(1), socket.next()).await {
+            Ok(message) => message,
+            Err(_) => {
+                socket
+                    .send(Message::Ping(Vec::new().into()))
+                    .await
+                    .map_err(|e| Error::Transport(e.to_string()))?;
+                continue;
+            }
+        };
+        match message {
             Some(Ok(Message::Text(text))) => {
                 return serde_json::from_str(&text).map_err(|e| Error::Rpc(e.to_string()))
             }

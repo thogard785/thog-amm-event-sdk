@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     loop {
-        let model = sdk.model();
+        let model = sdk.model()?;
         match model.quote_execution_exact_input(sell, buy, amount, gas_price) {
             Ok(quote) => println!(
                 "block={} amount_out={} last_posted_block={}",

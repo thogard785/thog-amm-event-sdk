@@ -19,7 +19,7 @@ fn all_deployed_snapshots_match_exactly() {
         let page = abi::getPoolDataCall::abi_decode_returns_validate(&encoded).unwrap();
         let model = PoolModel::from_snapshot(proxy, page, Some(thogamm_model::B256::ZERO)).unwrap();
         let sdk = event_driven_sdk::EventSynchronizer::from_model(model).unwrap();
-        let model = sdk.model();
+        let model = sdk.model().unwrap();
         for (i, c) in s["cases"].as_array().unwrap().iter().enumerate() {
             let a = model.state().tokens[c["inputIndex"].as_u64().unwrap() as usize].token;
             let b = model.state().tokens[c["outputIndex"].as_u64().unwrap() as usize].token;
@@ -101,7 +101,7 @@ fn replay_two_hundred_deployed_blocks_matches_every_snapshot() {
         }
         sdk.on_head(h, event_driven_sdk::CommitState::Finalized)
             .unwrap();
-        let state = sdk.model().state();
+        let state = sdk.model().unwrap().state();
         let expected = decode(b).into_state();
         assert_eq!(state.block, expected.block);
         assert_eq!(
@@ -145,7 +145,7 @@ fn execution_and_exact_output_match_deployed_bytecode_on_monad_fork() {
     )
     .unwrap();
     let sdk = event_driven_sdk::EventSynchronizer::from_model(model).unwrap();
-    let model = sdk.model();
+    let model = sdk.model().unwrap();
     let mut success = 0;
     for (i, c) in s["cases"].as_array().unwrap().iter().enumerate() {
         let a = model.state().tokens[c["inputIndex"].as_u64().unwrap() as usize].token;
@@ -193,7 +193,7 @@ fn boundary_states_match_deployed_bytecode() {
         let page = abi::getPoolDataCall::abi_decode_returns_validate(&encoded).unwrap();
         let model = PoolModel::from_snapshot(proxy, page, Some(thogamm_model::B256::ZERO)).unwrap();
         let sdk = event_driven_sdk::EventSynchronizer::from_model(model).unwrap();
-        let model = sdk.model();
+        let model = sdk.model().unwrap();
         for (i, c) in s["cases"].as_array().unwrap().iter().enumerate() {
             let a = model.state().tokens[c["inputIndex"].as_u64().unwrap() as usize].token;
             let b = model.state().tokens[c["outputIndex"].as_u64().unwrap() as usize].token;
