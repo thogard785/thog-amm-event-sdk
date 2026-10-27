@@ -89,7 +89,17 @@ pub fn fixture() -> Fixture {
     }
 }
 pub fn page(bytes: &Bytes) -> abi::PoolData {
-    abi::getPoolDataCall::abi_decode_returns_validate(bytes).unwrap()
+    historical_page(abi::getPoolDataCall::abi_decode_returns_validate(bytes).unwrap())
+}
+/// Reuse immutable model-2 captures for unchanged read-only and event semantics.
+/// This test-only migration changes the model byte, never expected quote results.
+/// Execution-policy tests use separately captured model-3 contract outputs.
+pub fn historical_page(mut p: abi::PoolData) -> abi::PoolData {
+    let word = p.words.iter_mut().find(|w| w.slot == 8).unwrap();
+    let version = (word.value >> 176usize) & U256::from(255);
+    assert!(version == U256::from(2) || version == U256::from(3));
+    word.value = (word.value & !(U256::from(255) << 176usize)) | (U256::from(3) << 176usize);
+    p
 }
 pub fn hash(number: u64, branch: u8) -> B256 {
     let mut bytes = [0u8; 32];

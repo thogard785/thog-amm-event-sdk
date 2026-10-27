@@ -1,9 +1,11 @@
+mod common;
 use alloy_sol_types::{sol, SolCall, SolValue};
+use common as support;
 use std::io::Read;
 use thogamm_model::{abi, Address, Bytes, PoolModel, U256};
 sol! { struct ContractFraction { uint256 numerator; uint256 denominator; } }
 #[test]
-fn all_deployed_snapshots_match_exactly() {
+fn historical_read_only_snapshots_match_after_model_identity_migration() {
     let mut bytes = Vec::new();
     flate2::read::GzDecoder::new(&include_bytes!("common/deployed-v8.json.gz")[..])
         .read_to_end(&mut bytes)
@@ -16,7 +18,9 @@ fn all_deployed_snapshots_match_exactly() {
     let mut refunds = 0;
     for s in f["snapshots"].as_array().unwrap() {
         let encoded: Bytes = s["snapshot"].as_str().unwrap().parse().unwrap();
-        let page = abi::getPoolDataCall::abi_decode_returns_validate(&encoded).unwrap();
+        let page = support::historical_page(
+            abi::getPoolDataCall::abi_decode_returns_validate(&encoded).unwrap(),
+        );
         let model = PoolModel::from_snapshot(
             proxy,
             page,
@@ -89,7 +93,9 @@ fn replay_two_hundred_deployed_blocks_matches_every_snapshot() {
         let h: thogamm_model::BlockHeader = serde_json::from_value(b["header"].clone()).unwrap();
         PoolModel::from_snapshot(
             proxy,
-            abi::getPoolDataCall::abi_decode_returns_validate(&data).unwrap(),
+            support::historical_page(
+                abi::getPoolDataCall::abi_decode_returns_validate(&data).unwrap(),
+            ),
             Some(h.hash),
             serde_json::from_value(b["shareBalances"].clone()).unwrap(),
         )
@@ -152,9 +158,9 @@ fn replay_two_hundred_deployed_blocks_matches_every_snapshot() {
 }
 
 #[test]
-fn execution_and_exact_output_match_deployed_bytecode_on_monad_fork() {
+fn execution_and_exact_output_match_model3_contract_on_monad_fork() {
     let mut bytes = Vec::new();
-    flate2::read::GzDecoder::new(&include_bytes!("common/execution-v8.json.gz")[..])
+    flate2::read::GzDecoder::new(&include_bytes!("common/execution-model3.json.gz")[..])
         .read_to_end(&mut bytes)
         .unwrap();
     let f: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -201,11 +207,12 @@ fn execution_and_exact_output_match_deployed_bytecode_on_monad_fork() {
         }
         checked += s["cases"].as_array().unwrap().len();
     }
-    assert_eq!(checked, 14040);
+    assert_eq!(checked, 32760);
+    assert!(success > 0);
     println!("{checked} execution cases; {success} exact successes");
 }
 #[test]
-fn boundary_states_match_deployed_bytecode() {
+fn historical_read_only_boundary_states_match_after_model_identity_migration() {
     let mut bytes = Vec::new();
     flate2::read::GzDecoder::new(&include_bytes!("common/boundaries-v8.json.gz")[..])
         .read_to_end(&mut bytes)
@@ -218,7 +225,9 @@ fn boundary_states_match_deployed_bytecode() {
     let mut refunds = 0;
     for s in f["snapshots"].as_array().unwrap() {
         let encoded: Bytes = s["snapshot"].as_str().unwrap().parse().unwrap();
-        let page = abi::getPoolDataCall::abi_decode_returns_validate(&encoded).unwrap();
+        let page = support::historical_page(
+            abi::getPoolDataCall::abi_decode_returns_validate(&encoded).unwrap(),
+        );
         let model = PoolModel::from_snapshot(
             proxy,
             page,
