@@ -1,7 +1,7 @@
 # ThogAMM event SDK
 
 Keep an in-memory ThogAMM quote model current through Monad subscriptions.
-Version **0.4.0** supports **schema 8 / wire 8 / model 2** and all 13 listed tokens,
+Version **0.4.1** supports **schema 8 / wire 8 / model 2** and all 13 listed tokens,
 including **SPYx, QQQx, EWYx, NVDAx and TSLAx**. These are unwrapped xStocks with
 18 decimals; [token addresses](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
 
@@ -18,7 +18,7 @@ calculations themselves are synchronous and make no network calls.
 
 ```toml
 [dependencies]
-event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.4.0" }
+event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.4.1" }
 ```
 
 ```rust
@@ -47,6 +47,10 @@ multipliers in a single batch of five calls per block with today's registry.
 It does not poll `getPoolData` or physical balances after startup. Use
 `model.state().block.number` and `.hash` to identify the published state; it can
 trail the proposed head. Keep consuming updates even when a quote rejects.
+Active listings are dynamic; share accounting uses the contract's
+[nine compiled xStock addresses](https://github.com/thogard785/thog-amm-poll-sdk/blob/v0.4.1/model/src/shares.rs).
+Listing another of those nine needs no model change; extending the contract's
+xStock catalog requires a matching SDK release.
 
 ## Quotes and settlement
 
@@ -60,6 +64,11 @@ Execution methods model an ordinary external caller/recipient without extra
 fees. Pass the transaction's effective gas price. Defaults assume a cold
 AuctionHandler; the `*_with_context` variants accept explicit account warmth.
 Read-only quotes use 90% cap thresholds; execution uses full settlement caps.
+`Quote.amount_in` is the amount passed to Thog. Execution `amount_out` is guaranteed
+recipient credit at the quoted state/context: compare `received >= amount_out`,
+not equality. For Buy it equals the target; actual xStock credit may be higher.
+Read-only quotes omit execution friction. Measure funding received by your router
+before quoting/passing input; see the [funding example](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#funding-through-an-aggregator).
 Share floors, xStock dust and direct/Buy rounding are included. For calldata and
 slippage protection, see the [settlement guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#quotes-limits-and-settlement).
 

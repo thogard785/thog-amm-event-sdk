@@ -797,7 +797,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "event-driven-sdk"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -2347,8 +2347,8 @@ dependencies = [
 
 [[package]]
 name = "thogamm-model"
-version = "0.4.0"
-source = "git+https://github.com/thogard785/thog-amm-poll-sdk?tag=v0.4.0#3e9e3c126104b420f2db18913ba6822b1693d000"
+version = "0.4.1"
+source = "git+https://github.com/thogard785/thog-amm-poll-sdk?tag=v0.4.1#e48f0151954b4dc338fb04e5ad12630119f03cec"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
