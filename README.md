@@ -19,6 +19,13 @@ model 2. The SDK rejects mismatched model identities; verify the pool's identity
 before switching. No v0.5.0 release tag is published by this PR. Pin a reviewed
 commit and commit Cargo.lock while testing this branch.
 
+The coordinated upgrade pauses both maker liquidity and taker execution while
+the shared operator backend is stopped, upgraded and restarted. The operator
+must confirm the new risk configuration and fresh valuations before unpausing;
+the migration preserves the previous widening. Reconnect using this matching SDK
+and obtain a complete snapshot after the upgrade. See
+[upgrade availability](https://github.com/thogard785/thog-amm-integration-guide/blob/codex/dynamic-maker-defense/THOGAMM_AGGREGATOR_INTEGRATION.md#upgrade-availability).
+
 ## Install and subscribe
 
 ```toml
