@@ -1,172 +1,105 @@
 # ThogAMM event SDK
 
-A Rust SDK for aggregators integrating ThogAMM on Monad. Load pool state once,
-then keep an in-memory quote model up to date through event subscriptions.
-**Updates after initialization make zero read RPC calls.**
+Keep an in-memory ThogAMM quote model current through Monad subscriptions.
+Version **0.4.0** supports **schema 8 / wire 8 / model 2** and all 13 listed tokens,
+including **SPYx, QQQx, EWYx, NVDAx and TSLAx**. These are unwrapped xStocks with
+18 decimals; [token addresses](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
 
-It supports the deployed schema-7 registry and policy events. A listing or
-retirement returns `Error::RegistryChanged`: reconnect to obtain the complete
-replacement state, since those events omit policy rows required for pricing.
+Pool/share movements come from events. **Issuer multipliers are read at every
+published block**, because a scheduled rebase can activate without a log. Quote
+calculations themselves are synchronous and make no network calls.
 
-- **Network:** Monad mainnet, chain ID `143`
-- **ThogAMM pool:** `0x80c74517BCC2D67fFE02D3ED886796272F647210`
-- **Connection:** a Monad HTTP RPC URL for initialization and a WebSocket URL
-  supporting `logs` and `monadNewHeads` subscriptions
+- Monad mainnet, chain ID **143**.
+- Pool: `0x80c74517BCC2D67fFE02D3ED886796272F647210`.
+- HTTP RPC plus a WebSocket endpoint supporting `logs` and `monadNewHeads`.
+- Rust **1.88+**, Cargo resolver **3**, Tokio. Commit your application's lockfile.
 
-## Install
+## Install and subscribe
 
 ```toml
 [dependencies]
-event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.3.0" }
+event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.4.0" }
 ```
-
-Requires Rust 1.88 or later and Tokio for subscriptions. Set your application's
-`rust-version` and use Cargo resolver `"3"` at the package or workspace root so
-dependencies respect that Rust version. Commit your application's `Cargo.lock`.
-Import the crate as `event_driven_sdk`.
-
-## Connect once, then quote locally
-
-Pass your Monad RPC URLs, the ThogAMM pool address above, the two token addresses,
-an input amount and your transaction's effective gas price in wei:
 
 ```rust
 use event_driven_sdk::{Address, Config, EventDrivenSdk, Result, U256};
 
 async fn follow_quotes(
-    http_rpc: &str,
-    ws_rpc: &str,
-    pool: Address,
-    token_in: Address,
-    token_out: Address,
-    amount_in: U256,
-    gas_price: U256,
+    http: &str, ws: &str, pool: Address, token_in: Address, token_out: Address,
+    amount_in: U256, effective_gas_price: U256,
 ) -> Result<()> {
-    let mut sdk = EventDrivenSdk::connect(http_rpc, ws_rpc, pool, Config::default()).await?;
+    let mut sdk = EventDrivenSdk::connect(http, ws, pool, Config::default()).await?;
     loop {
-        let model = sdk.model();
-        match model.quote_execution_exact_input(token_in, token_out, amount_in, gas_price) {
-            Ok(quote) => println!("amount_out={}", quote.amount_out),
-            Err(error) => eprintln!("quote unavailable: {error}"),
+        match sdk.model().quote_execution_exact_input(
+            token_in, token_out, amount_in, effective_gas_price,
+        ) {
+            Ok(q) => println!("{}", q.amount_out),
+            Err(e) => eprintln!("quote unavailable: {e}"),
         }
         sdk.next_update().await?;
     }
 }
 ```
 
-`connect()` opens subscriptions and loads the initial state with one
-`getPoolData(0, 32)` call. `next_update()` consumes subscription messages and
-publishes a complete finalized snapshot, including blocks without trades.
-There are no polling, log-history, balance or token-discovery reads while running.
+`connect()` subscribes first, then loads a finalized pool/issuer snapshot at one
+block hash. `next_update()` replays complete finalized blocks and reads current
+multipliers in a single batch of five calls per block with today's registry.
+It does not poll `getPoolData` or physical balances after startup. Use
+`model.state().block.number` and `.hash` to identify the published state; it can
+trail the proposed head. Keep consuming updates even when a quote rejects.
 
-Finalized state may trail the latest proposed block. Use
-`model.state().block.number` and `.hash` to identify the quoted state;
-`model.state().tokens` provides listed token addresses and decimals. Keep calling
-`next_update()` to process incoming messages. Quote methods are synchronous and
-make no network calls.
+## Quotes and settlement
 
-## Quote trade sizes
+The model is shared with the [polling SDK](https://github.com/thogard785/thog-amm-poll-sdk#quote-methods).
+It provides `quote_exact_input`, `quote_execution_exact_input`,
+`quote_exact_output`, `limits` and `marginal_price`. For several sizes, use
+`model.prepare(token_in, token_out)?` and quote the resulting pair. All amounts
+are raw `U256` token units. Rebuild prepared pairs after each update.
 
-Amounts are `U256` values in raw token units: one token with six decimals is
-`1_000_000`. `gas_price` is the intended transaction's effective price in wei;
-for EIP-1559, use `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`.
-Execution applies one 10 bp output reduction if that price exceeds twice the
-quote block base fee or the AuctionHandler is already warm. The convenience
-methods below assume a cold AuctionHandler. Use
-`quote_execution_exact_input_with_context(..., gas_price, auction_handler_warm)`
-and `quote_exact_output_with_context(...)` to specify account warmth explicitly.
-`quote_exact_input(...)` matches `makerQuoteExactInput` with its strict 90%
-receiving-inventory caps and no execution widening. Execution checks full caps.
+Execution methods model an ordinary external caller/recipient without extra
+fees. Pass the transaction's effective gas price. Defaults assume a cold
+AuctionHandler; the `*_with_context` variants accept explicit account warmth.
+Read-only quotes use 90% cap thresholds; execution uses full settlement caps.
+Share floors, xStock dust and direct/Buy rounding are included. For calldata and
+slippage protection, see the [settlement guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#quotes-limits-and-settlement).
 
-| Method on `PoolModel` | Result |
-| --- | --- |
-| `quote_execution_exact_input(token_in, token_out, amount_in, gas_price)` | Output amount, including final full-cap checks; cold AuctionHandler |
-| `quote_exact_output(token_in, token_out, amount_out, gas_price)` | Required input for an exact output amount |
-| `limits(token_in, token_out)` | Directional input and output bounds |
-| `marginal_price(token_in, token_out, amount_in)` | A fraction expressing raw output units per raw input unit |
+`at_block` ages an existing price without fetching new inventory, policy or
+issuer state. Independent quotes do not simulate successive fills.
 
-For multiple amounts on the same pair, prepare it once per snapshot:
+## Errors and custom streams
 
-```rust
-let pair = model.prepare(token_in, token_out)?;
-for amount_in in amounts_in {
-    let quote = pair.quote_execution_exact_input(amount_in, gas_price)?;
-    println!("{} -> {}", quote.amount_in, quote.amount_out);
-}
-```
+A disconnect, missing block/log, failed issuer read or malformed publication
+returns an error and preserves the last published snapshot. Reconnect explicitly
+with `connect()`. A registry change returns `Error::RegistryChanged`; reconnect
+and rebuild prepared pairs. On `ContractUpgraded` or an unsupported format,
+verify compatibility before using the matching release.
 
-A prepared pair has the same quote methods, without the two token arguments.
-Preparation and successful quotes allocate no memory. Clone a model to share
-its immutable snapshot across workers, and prepare a new pair after an update.
-Quotes use the contract's integer rounding and reject paused trading, stale
-prices, disabled directions and insufficient capacity.
+`EventSynchronizer::from_model` accepts a snapshot with a known finalized hash.
+Feed `on_log` and `on_head(header, commitment, &multipliers_by_block_hash)` in
+socket order. Before a finalized head, call `pending_headers(&header)` and supply
+hash-pinned issuer multipliers for every returned block. The helper
+`model::rpc::read_multipliers` can fetch them. Proposed/Voted/Verified heads need
+no multiplier input. The reducer itself performs no I/O.
 
-Quotes apply to the snapshot's block. `model.at_block(number, base_fee)` evaluates
-price aging for a later landing block, assuming no intervening trades or price
-updates. Pairs share balances and portfolio risk; independent quotes do not
-simulate successive fills. For swap encoding and settlement, see the shared
-[transaction guide](https://github.com/thogard785/thog-amm-poll-sdk#build-a-swap-transaction).
+`model::events::log_filters(pool, wmon)` covers ordinary transfers, xStock
+`TransferShares`, WMON and pool checkpoints. Use one ordered Monad connection,
+including all commitment stages: each subsequent header closes the previous
+log frame. Generic Ethereum `newHeads` does not establish this completeness.
+Forced native transfers require account-state data or a fresh snapshot.
 
-## Handle connection errors
+## Example and verification
 
-If `next_update()` reports a disconnect or missing events, create a new client
-with `connect()` to load current state and resume subscriptions. The SDK reports
-these errors instead of silently making recovery reads. The last valid snapshot
-keeps its original block stamp. Quote errors such as a stale price or unavailable
-pair do not stop the subscription; keep processing updates.
-
-If the registry changes, reconnect and rebuild all prepared pairs. If the SDK
-reports an unsupported state format or a contract upgrade, verify compatibility
-and use the matching release before reconnecting.
-
-Event completeness assumes the supported tokens emit their ordinary balance
-movements and native MON follows the executor’s checkpointed paths. Forced
-native transfers or tokens that change balances without events require account
-state updates or a fresh atomic snapshot; log subscriptions alone cannot prove
-those changes. The SDK does not perform hidden recovery reads.
-
-## Use your own event stream
-
-`EventSynchronizer::from_model()` accepts a finalized snapshot with a known block
-hash and performs no I/O. Pass `BlockHeader`, `CommitState` and `RpcLog` values to
-`on_head` and `on_log`. `model::events::log_filters(pool, wmon)` provides the filters.
-
-Use one ordered Monad connection and pass every header commitment stage and log
-in received order. The provider must finish a block's logs before its next header
-notification. Standard Ethereum `newHeads` alone does not provide the completeness
-information this reducer needs. The built-in client handles these subscriptions.
-
-## Run the example
-
-Set `THOGAMM_HTTP_RPC`, `THOGAMM_WS_RPC`, `THOGAMM_PROXY` (the pool address above),
-`TOKEN_IN`, `TOKEN_OUT`, `AMOUNT_IN` and `EFFECTIVE_GAS_PRICE_WEI`, then run:
+[examples/subscribe.rs](examples/subscribe.rs) reads `THOGAMM_HTTP_RPC`,
+`THOGAMM_WS_RPC`, `THOGAMM_PROXY`, `TOKEN_IN`, `TOKEN_OUT`, `AMOUNT_IN` and
+`EFFECTIVE_GAS_PRICE_WEI`:
 
 ```sh
 cargo run --locked --example subscribe
+cargo test --locked
 ```
 
-[examples/subscribe.rs](examples/subscribe.rs) processes updates and prints local
-quotes. For integrations that already schedule their own state reads, the
-[polling SDK](https://github.com/thogard785/thog-amm-poll-sdk) offers the same quote
-model with one `eth_call` per refresh. Both SDKs are [MIT licensed](LICENSE).
-
-## Schema 7 and verification
-
-Version **0.3.0** supports schema 7 / wire 7 / model 1 and up to 32 active
-tokens. It replaces the incompatible schema-6 model. State includes all 126
-words, all registered ERC-20 balances, native MON, lending exposure offsets,
-separate bid/ask widths, volume charges, wrapper policies and inventory caps.
-
-Volume cost is `ceil(rate * notionalUSDWad² / 1e27)` and remains payable for
-risk-reducing trades, same-category trades and zero lambda. Sliding output
-refunds participate in the nonlinear output solve with exact integer rounding.
-
-The [integration guide](https://github.com/thogard785/thog-amm-integration-guide)
-contains the full ABI, state layout, math, settlement rules and reproducible
-fixtures. Tests cover **9,240 contract comparisons**: 2,016 mainnet read-only
-queries, 1,680 execution/exact-output calls on a local Monad fork, and 5,544
-fork boundary cases. All 5,362 successful results match exactly; all 3,878
-rejected cases also reject locally. Event replay matches 200 consecutive
-mainnet snapshots, including every word, ERC-20 balance and native balance.
-Run `cargo test --locked` (or `cargo test --workspace --locked` in the polling
-repository). Fork tests do not broadcast transactions.
+Tests match **39,936 contract cases** and 200 consecutive mainnet snapshots,
+plus subscription ordering, reorgs and log-free issuer activations.
+[Fixtures and reproduction instructions](https://github.com/thogard785/thog-amm-integration-guide#verification).
+Upgrade from 0.3 with the new reader/issuer inputs; schema-7 state is incompatible.
+[MIT license](LICENSE).

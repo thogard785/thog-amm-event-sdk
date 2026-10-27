@@ -24,8 +24,8 @@ pub fn fixture() -> Fixture {
             .unwrap();
         serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
     };
-    let quotes = read(include_bytes!("deployed-v7.json.gz"));
-    let events = read(include_bytes!("events-v7.json.gz"));
+    let quotes = read(include_bytes!("deployed-v8.json.gz"));
+    let events = read(include_bytes!("events-v8.json.gz"));
     let normalize = |encoded: &serde_json::Value| {
         let bytes: Bytes = encoded.as_str().unwrap().parse().unwrap();
         let mut p = page(&bytes);
@@ -108,7 +108,8 @@ pub fn header(number: u64, base_fee: U256) -> BlockHeader {
 pub fn model(proxy: Address, base_fee: U256, bytes: &Bytes) -> PoolModel {
     let p = page(bytes);
     let h = header(p.blockNumber.to::<u64>(), base_fee);
-    PoolModel::new(PoolState::from_pages(proxy, h, vec![p]).unwrap()).unwrap()
+    PoolModel::new(PoolState::from_pages(proxy, h, vec![p.clone()], shares_for(&p)).unwrap())
+        .unwrap()
 }
 pub fn logs(event: &EventSet, base_fee: U256) -> Vec<RpcLog> {
     let p = page(&event.afterState);
@@ -162,32 +163,144 @@ impl MockRpc {
 }
 #[async_trait::async_trait]
 impl thogamm_model::rpc::ChainReader for MockRpc {
-    async fn call(
+    async fn header(
         &self,
-        _to: Address,
-        data: Bytes,
         block: thogamm_model::rpc::CallBlock,
-    ) -> thogamm_model::Result<Bytes> {
+    ) -> thogamm_model::Result<BlockHeader> {
+        use thogamm_model::rpc::CallBlock;
+        let c = self.0.lock().unwrap();
+        let h = match block {
+            CallBlock::Hash(hash) => c.headers.values().find(|h| h.hash == hash).unwrap(),
+            CallBlock::Number(number) => &c.headers[&number],
+            _ => &c.headers[&c.head],
+        };
+        Ok(h.clone())
+    }
+    async fn calls(
+        &self,
+        calls: Vec<(Address, Bytes)>,
+        block: thogamm_model::rpc::CallBlock,
+    ) -> thogamm_model::Result<Vec<Bytes>> {
         use thogamm_model::rpc::CallBlock;
         let mut c = self.0.lock().unwrap();
-        c.calls.push((block, data.clone()));
-        if c.fail_calls {
-            return Err(thogamm_model::Error::Rpc("injected read failure".into()));
-        }
         let hash = match block {
             CallBlock::Hash(hash) => hash,
-            CallBlock::Number(number) => c.headers[&number].hash,
-            _ => c.headers[&c.head].hash,
+            _ => panic!("all state reads must be hash-pinned"),
         };
         let p = c.states[&hash].clone();
-        let call = abi::getPoolDataCall::abi_decode_validate(&data).unwrap();
-        assert_eq!((call.startTokenIndex, call.stopTokenIndex), (0, 32));
-        Ok(abi::getPoolDataCall::abi_encode_returns(&p).into())
+        let shares = shares_for(&p);
+        calls
+            .into_iter()
+            .map(|(to, data)| {
+                c.calls.push((block, data.clone()));
+                if c.fail_calls {
+                    return Err(thogamm_model::Error::Rpc("injected read failure".into()));
+                }
+                let bytes = if data.starts_with(&abi::getPoolDataCall::SELECTOR) {
+                    let call = abi::getPoolDataCall::abi_decode_validate(&data).unwrap();
+                    assert_eq!((call.startTokenIndex, call.stopTokenIndex), (0, 28));
+                    abi::getPoolDataCall::abi_encode_returns(&p)
+                } else if data.starts_with(&abi::sharesOfCall::SELECTOR) {
+                    abi::sharesOfCall::abi_encode_returns(&shares[&to].shares)
+                } else if data.starts_with(&abi::getCurrentMultiplierCall::SELECTOR) {
+                    abi::getCurrentMultiplierCall::abi_encode_returns(
+                        &abi::getCurrentMultiplierReturn {
+                            multiplier: shares[&to].multiplier,
+                            activation: U256::ZERO,
+                            period: U256::ZERO,
+                        },
+                    )
+                } else {
+                    panic!("unexpected calldata {data}")
+                };
+                Ok(bytes.into())
+            })
+            .collect()
     }
 }
-/// Same contract snapshot as model(), with no invented block hash for a latest call.
+pub fn share_images() -> &'static BTreeMap<u64, thogamm_model::ShareBalances> {
+    static IMAGES: std::sync::OnceLock<BTreeMap<u64, thogamm_model::ShareBalances>> =
+        std::sync::OnceLock::new();
+    IMAGES.get_or_init(|| {
+        use std::io::Read;
+        let mut images = BTreeMap::new();
+        for data in [
+            include_bytes!("events-v8.json.gz").as_slice(),
+            include_bytes!("deployed-v8.json.gz").as_slice(),
+        ] {
+            let mut bytes = Vec::new();
+            flate2::read::GzDecoder::new(data)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            let f: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            for b in f
+                .get("blocks")
+                .or_else(|| f.get("snapshots"))
+                .unwrap()
+                .as_array()
+                .unwrap()
+            {
+                let encoded: Bytes = b["snapshot"].as_str().unwrap().parse().unwrap();
+                images.insert(
+                    page(&encoded).blockNumber.to::<u64>(),
+                    serde_json::from_value(b["shareBalances"].clone()).unwrap(),
+                );
+            }
+        }
+        images
+    })
+}
+pub fn shares_for(p: &abi::PoolData) -> thogamm_model::ShareBalances {
+    // Synthetic publication fixtures advance only block context, retaining the seed holdings.
+    let candidates = share_images();
+    let valid = |shares: &&thogamm_model::ShareBalances| {
+        p.tokens.iter().enumerate().all(|(i, t)| {
+            shares.get(&t.token).is_none_or(|b| {
+                thogamm_model::math::mul_div(
+                    b.shares,
+                    b.multiplier,
+                    thogamm_model::math::pow10(18),
+                    false,
+                )
+                .unwrap()
+                    == p.portfolioBalances[i]
+            })
+        })
+    };
+    candidates
+        .get(&p.blockNumber.to::<u64>())
+        .filter(valid)
+        .or_else(|| candidates.values().find(valid))
+        .expect("fixture issuer state not found")
+        .clone()
+}
+pub fn multipliers_for(m: &PoolModel) -> thogamm_model::Multipliers {
+    m.state()
+        .share_balances
+        .iter()
+        .map(|(a, b)| (*a, b.multiplier))
+        .collect()
+}
+pub fn multiplier_blocks() -> BTreeMap<B256, thogamm_model::Multipliers> {
+    share_images()
+        .iter()
+        .map(|(n, shares)| {
+            (
+                hash(*n, 0),
+                shares.iter().map(|(a, b)| (*a, b.multiplier)).collect(),
+            )
+        })
+        .collect()
+}
+/// Expected snapshot for the mock reader’s deterministic header.
 pub fn polled_model(proxy: Address, bytes: &Bytes) -> PoolModel {
-    PoolModel::from_snapshot(proxy, page(bytes), None).unwrap()
+    PoolModel::from_snapshot(
+        proxy,
+        page(bytes),
+        Some(hash(page(bytes).blockNumber.to::<u64>(), 0)),
+        shares_for(&page(bytes)),
+    )
+    .unwrap()
 }
 pub fn model_header(model: &PoolModel) -> BlockHeader {
     model.state().block.clone().try_into().unwrap()
