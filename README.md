@@ -1,7 +1,7 @@
 # ThogAMM event SDK
 
 Keep an in-memory ThogAMM quote model current through Monad subscriptions.
-Version **0.4.1** supports **schema 8 / wire 8 / model 2** and all 13 listed tokens,
+Pending version **0.5.0** supports **schema 8 / wire 8 / model 3** and all 13 listed tokens,
 including **SPYx, QQQx, EWYx, NVDAx and TSLAx**. These are unwrapped xStocks with
 18 decimals; [token addresses](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
 
@@ -14,11 +14,16 @@ calculations themselves are synchronous and make no network calls.
 - HTTP RPC plus a WebSocket endpoint supporting `logs` and `monadNewHeads`.
 - Rust **1.88+**, Cargo resolver **3**, Tokio. Commit your application's lockfile.
 
+This branch targets the pending model-3 contract upgrade. Released v0.4.1 is for
+model 2. The SDK rejects mismatched model identities; verify the pool's identity
+before switching. No v0.5.0 release tag is published by this PR. Pin a reviewed
+commit and commit Cargo.lock while testing this branch.
+
 ## Install and subscribe
 
 ```toml
 [dependencies]
-event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.4.1" }
+event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", branch = "codex/dynamic-maker-defense" }
 ```
 
 ```rust
@@ -64,6 +69,37 @@ Execution methods model an ordinary external caller/recipient without extra
 fees. Pass the transaction's effective gas price. Defaults assume a cold
 AuctionHandler; the `*_with_context` variants accept explicit account warmth.
 Read-only quotes use 90% cap thresholds; execution uses full settlement caps.
+Execution applies a dynamic output reduction. Evaluate the following rows in
+order using the transaction's **effective** gas price and the current block's
+base fee; every gas-price comparison is strictly greater-than.
+
+| First matching condition | Raw defense | Defense after a valuation update earlier in this block |
+| --- | ---: | ---: |
+| FastLane AuctionHandler is already warm | 12 bp | 2 bp |
+| `gasPrice > 2.5 * baseFee` | 12 bp | 2 bp |
+| `gasPrice > 2 * baseFee` | 8 bp | 1 bp |
+| `gasPrice > 1.5 * baseFee` | 6 bp | 0.5 bp |
+| Otherwise | 0 bp | 0 bp |
+
+The same-block column applies exactly when the latest accepted valuation's
+`postedBlock` equals the execution block: `max(rawDefense / 4 - 1 bp, 0)`.
+A risk, wrapper, cap or inventory update alone does not qualify. The raw defense
+applies when the latest valuation is from an earlier block. Warmth and gas-price
+triggers do not stack. With zero base fee, any positive gas price selects 12 bp;
+a cold zero-price transaction selects zero. Fractional thresholds are exact,
+including odd base fees; implementations compare differences to avoid overflow.
+
+The configured age widening is **0.5 bp per elapsed block** without a valuation
+update (`widen_per_block_bps: 0.50`, encoded as 50 in 0.01 bp units). It adds to
+the pair's spread and affects both read-only and execution quotes. Execution
+defense is a separate multiplicative output reduction, not another age term.
+
+The SDK's default execution methods assume a cold AuctionHandler; the
+`*_with_context` methods accept explicit warmth. For EIP-1559, effective gas price
+is `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`. `at_block(number, base_fee)`
+sets both age and the block/base-fee context used by this policy; it cannot predict
+an intervening valuation publication, trade or inventory change.
+
 `Quote.amount_in` is the amount passed to Thog. Execution `amount_out` is guaranteed
 recipient credit at the quoted state/context: compare `received >= amount_out`,
 not equality. For Buy it equals the target; actual xStock credit may be higher.
@@ -72,7 +108,7 @@ before quoting/passing input; see the [funding example](https://github.com/thoga
 Share floors, xStock dust and direct/Buy rounding are included. For calldata and
 slippage protection, see the [settlement guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#quotes-limits-and-settlement).
 
-`at_block` ages an existing price without fetching new inventory, policy or
+`at_block` changes age and execution context without fetching new inventory, policy or
 issuer state. Independent quotes do not simulate successive fills.
 
 ## Errors and custom streams
@@ -107,8 +143,12 @@ cargo run --locked --example subscribe
 cargo test --locked
 ```
 
-Tests match **39,936 contract cases** and 200 consecutive mainnet snapshots,
-plus subscription ordering, reorgs and log-free issuer activations.
+Tests check 32,760 execution cases against the newly compiled model-3 contract
+on a local Monad fork, plus 25,896 historical read-only cases and 200 blocks of
+event replay with a test-only model identity migration. Historical expected
+results remain unchanged and do not validate the new defense. Tests also cover
+subscription ordering, reorgs and log-free issuer activations.
 [Fixtures and reproduction instructions](https://github.com/thogard785/thog-amm-integration-guide#verification).
-Upgrade from 0.3 with the new reader/issuer inputs; schema-7 state is incompatible.
+Upgrade from 0.4.1 together with the contract migration; model-2 and schema-7
+snapshots are incompatible. Reconnect after the upgrade with this matching SDK.
 [MIT license](LICENSE).
