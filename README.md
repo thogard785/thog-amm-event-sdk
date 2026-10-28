@@ -1,7 +1,7 @@
 # ThogAMM event SDK
 
 Keep an in-memory ThogAMM quote model current through Monad subscriptions.
-Pending version **0.5.0** supports **schema 8 / wire 8 / model 3** and all 13 listed tokens,
+Version **0.5.0** supports **schema 8 / wire 8 / model 3** and all 13 listed tokens,
 including **SPYx, QQQx, EWYx, NVDAx and TSLAx**. These are unwrapped xStocks with
 18 decimals; [token addresses](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
 
@@ -14,23 +14,24 @@ calculations themselves are synchronous and make no network calls.
 - HTTP RPC plus a WebSocket endpoint supporting `logs` and `monadNewHeads`.
 - Rust **1.88+**, Cargo resolver **3**, Tokio. Commit your application's lockfile.
 
-This branch targets the pending model-3 contract upgrade. Released v0.4.1 is for
-model 2. The SDK rejects mismatched model identities; verify the pool's identity
-before switching. No v0.5.0 release tag is published by this PR. Pin a reviewed
-commit and commit Cargo.lock while testing this branch.
+Model 3 was activated at Monad block **117177785** in
+[the proxy upgrade transaction](https://monadscan.com/tx/0x962e87a568d98fba303d7077f6b51242599c07446799b87f117cbd14065214d2).
+Use **v0.5.0** for model 3; v0.4.1 is retained for historical model-2 snapshots.
+The SDK rejects mismatched model identities. Verify the selected snapshot's
+identity and commit your application's `Cargo.lock`.
 
 The coordinated upgrade pauses both maker liquidity and taker execution while
 the shared operator backend is stopped, upgraded and restarted. The operator
 must confirm the new risk configuration and fresh valuations before unpausing;
 the migration preserves the previous widening. Reconnect using this matching SDK
 and obtain a complete snapshot after the upgrade. See
-[upgrade availability](https://github.com/thogard785/thog-amm-integration-guide/blob/codex/dynamic-maker-defense/THOGAMM_AGGREGATOR_INTEGRATION.md#upgrade-availability).
+[upgrade availability](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#upgrade-availability).
 
 ## Install and subscribe
 
 ```toml
 [dependencies]
-event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", branch = "codex/dynamic-maker-defense" }
+event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.5.0" }
 ```
 
 ```rust

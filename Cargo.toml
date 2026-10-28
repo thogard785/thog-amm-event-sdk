@@ -11,7 +11,7 @@ readme = "README.md"
 repository = "https://github.com/thogard785/thog-amm-event-sdk"
 
 [dependencies]
-thogamm-model = { git = "https://github.com/thogard785/thog-amm-poll-sdk", rev = "270d28a27952d93bf151297e99a3a875029f97fd" }
+thogamm-model = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.5.0" }
 alloy-primitives = "=1.7.3"
 futures-util = { version = "0.3.31", features = ["sink"] }
 serde_json = "1.0"
