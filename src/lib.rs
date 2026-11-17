@@ -26,7 +26,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 /// The stage a Monad block has reached, as `monadNewHeads` reports it in
-/// `commitState`. <https://docs.monad.xyz/reference/websockets>
+/// `commitState`. <https://docs.monad.xyz/reference/json-rpc/overview#websocket-subscriptions>
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitState {
     Proposed,
