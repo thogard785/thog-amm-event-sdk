@@ -409,3 +409,59 @@ fn invalid_stored_multiplier_never_changes_the_published_state() {
         assert_eq!(sdk.model().state(), &before);
     }
 }
+
+#[test]
+fn all_nine_stocks_apply_pool_multiplier_updates_only_at_finalization() {
+    use alloy_sol_types::SolCall;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(&include_bytes!("common/deployed-stored-multipliers.json.gz")[..])
+        .read_to_end(&mut bytes)
+        .unwrap();
+    let f: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let s = &f["snapshots"][0];
+    let proxy = f["proxy"].as_str().unwrap().parse().unwrap();
+    let encoded: thogamm_model::Bytes = s["snapshot"].as_str().unwrap().parse().unwrap();
+    let seed = thogamm_model::PoolModel::from_snapshot(
+        proxy,
+        abi::getPoolDataCall::abi_decode_returns_validate(&encoded).unwrap(),
+        Some(s["blockHash"].as_str().unwrap().parse().unwrap()),
+        serde_json::from_value(s["shareBalances"].clone()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(seed.state().share_balances.len(), 9);
+    for &token in seed.state().share_balances.keys() {
+        let mut expected = seed.state().clone();
+        let mut h = support::header(expected.block.number + 1, expected.block.base_fee_per_gas);
+        h.parent_hash = expected.block.hash.unwrap();
+        let value = expected.share_balances[&token].multiplier * U256::from(3) / U256::from(2);
+        expected.share_balances.get_mut(&token).unwrap().multiplier = value;
+        expected.refresh_share_balances().unwrap();
+        expected.block = h.clone().into();
+        let mut sdk = EventSynchronizer::from_model(seed.clone()).unwrap();
+        sdk.on_head(h.clone(), C::Proposed).unwrap();
+        let event = abi::MakerMultiplierUpdated {
+            token,
+            multiplier: value,
+        }
+        .encode_log_data();
+        sdk.on_log(RpcLog {
+            address: proxy,
+            topics: event.topics().to_vec(),
+            data: event.data,
+            block_hash: h.hash,
+            block_number: h.number,
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        })
+        .unwrap();
+        assert_eq!(
+            sdk.model().state(),
+            seed.state(),
+            "proposed sync changed the published model"
+        );
+        sdk.on_head(h, C::Finalized).unwrap().unwrap();
+        assert_eq!(sdk.model().state(), &expected);
+    }
+}

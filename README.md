@@ -1,13 +1,13 @@
 # ThogAMM event SDK
 
 Keep an in-memory ThogAMM quote model current through Monad subscriptions.
-Version **0.6.0** supports **schema 8 / wire 8 / model 3** with executor-stored
+Version **0.6.1** supports **schema 8 / wire 8 / model 3** with pool-stored
 xStock multipliers and the expanded 17-token registry. The nine unwrapped
 xStocks are SPYx, QQQx, EWYx, NVDAx, TSLAx, SMHx, SPCXx, MUx and SKHYx, all
 with 18 decimals. [Token addresses](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
 
 Quote calculations are synchronous and make no network calls. The polling SDK
-reads each multiplier from the executor's `storedMultiplier(token)`; the event
+reads each multiplier from the pool's `storedMultiplier(token)`; the event
 SDK applies `MakerMultiplierUpdated` after its initial snapshot. Issuer changes
 alone do not change the model's stored values.
 
@@ -16,26 +16,17 @@ alone do not change the model's stored values.
 - HTTP RPC plus a WebSocket endpoint supporting `logs` and `monadNewHeads`.
 - Rust **1.88+**, Cargo resolver **3**, Tokio. Commit your application's lockfile.
 
-Model 3 was activated at Monad block **117177785** in
-[the proxy upgrade transaction](https://monadscan.com/tx/0x962e87a568d98fba303d7077f6b51242599c07446799b87f117cbd14065214d2).
-Use **v0.6.0** with the stored-multiplier implementation. v0.5.0 reads issuer
-multipliers and is for the previous implementation. Schema/wire/model numbers
-remain 8/8/3, so those numbers alone do not distinguish the implementations.
-Verify the implementation address in the integration guide, reconnect after
-upgrades, and commit your application's `Cargo.lock`.
-
-The coordinated upgrade pauses both maker liquidity and taker execution while
-the shared operator backend is stopped, upgraded and restarted. The operator
-must confirm the new risk configuration and fresh valuations before unpausing;
-the migration preserves the previous widening. Reconnect using this matching SDK
-and obtain a complete snapshot after the upgrade. See
-[upgrade availability](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#upgrade-availability).
+Use this release with implementation
+`0xb108a1daf3c9ba52778b97a15ebdfa3f6f59b506`. SDK 0.5.0 uses issuer
+multipliers and is incompatible; 0.6.0 already supports stored multipliers.
+The state format remains 8/8/3, so verify implementation compatibility after
+an upgrade and load a fresh snapshot.
 
 ## Install and subscribe
 
 ```toml
 [dependencies]
-event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.6.0" }
+event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.6.1" }
 ```
 
 ```rust
@@ -58,13 +49,13 @@ async fn follow_quotes(
 }
 ```
 
-`connect()` subscribes first, then loads pool state, physical shares and executor
+`connect()` subscribes first, then loads pool state, physical shares and pool-stored
 multipliers at one finalized block hash. `next_update()` replays complete
 finalized blocks, including `MakerMultiplierUpdated`, without RPC reads.
 Use `model.state().block.number` and `.hash` to identify the published state;
 it can trail the proposed head. Keep consuming updates even when a quote rejects.
 Active listings are dynamic; share accounting uses the contract's
-[nine compiled xStock addresses](https://github.com/thogard785/thog-amm-poll-sdk/blob/v0.6.0/model/src/shares.rs).
+[nine compiled xStock addresses](https://github.com/thogard785/thog-amm-poll-sdk/blob/v0.6.1/model/src/shares.rs).
 Listing another of those nine needs no model change; extending the contract's
 xStock catalog requires a matching SDK release.
 
@@ -80,42 +71,18 @@ Execution methods model an ordinary external caller/recipient without extra
 fees. Pass the transaction's effective gas price. Defaults assume a cold
 AuctionHandler; the `*_with_context` variants accept explicit account warmth.
 Read-only quotes use 90% cap thresholds; execution uses full settlement caps.
-Execution applies a dynamic output reduction. Evaluate the following rows in
-order using the transaction's **effective** gas price and the current block's
-base fee; every gas-price comparison is strictly greater-than.
-
-| First matching condition | Raw defense | Defense after a valuation update earlier in this block |
-| --- | ---: | ---: |
-| FastLane AuctionHandler is already warm | 12 bp | 2 bp |
-| `gasPrice > 2.5 * baseFee` | 12 bp | 2 bp |
-| `gasPrice > 2 * baseFee` | 8 bp | 1 bp |
-| `gasPrice > 1.5 * baseFee` | 6 bp | 0.5 bp |
-| Otherwise | 0 bp | 0 bp |
-
-The same-block column applies exactly when the latest accepted valuation's
-`postedBlock` equals the execution block: `max(rawDefense / 4 - 1 bp, 0)`.
-A risk, wrapper, cap or inventory update alone does not qualify. The raw defense
-applies when the latest valuation is from an earlier block. Warmth and gas-price
-triggers do not stack. With zero base fee, any positive gas price selects 12 bp;
-a cold zero-price transaction selects zero. Fractional thresholds are exact,
-including odd base fees; implementations compare differences to avoid overflow.
-
-The configured age widening is **0.5 bp per elapsed block** without a valuation
-update (`widen_per_block_bps: 0.50`, encoded as 50 in 0.01 bp units). It adds to
-the pair's spread and affects both read-only and execution quotes. Execution
-defense is a separate multiplicative output reduction, not another age term.
-
-The SDK's default execution methods assume a cold AuctionHandler; the
-`*_with_context` methods accept explicit warmth. For EIP-1559, effective gas price
-is `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`. `at_block(number, base_fee)`
-sets both age and the block/base-fee context used by this policy; it cannot predict
-an intervening valuation publication, trade or inventory change.
+Execution output also depends on the block base fee and whether prices were
+updated in the execution block. For EIP-1559, effective gas price is
+`min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`. The SDK includes these
+adjustments and price-age widening; see the
+[exact rules](https://github.com/thogard785/thog-amm-integration-guide/blob/main/REFERENCE.md#exact-output-marginal-prices-and-settlement).
+Simulate the full settlement route with its actual fee and account-warmth context.
 
 `Quote.amount_in` is the amount passed to Thog. Execution `amount_out` is guaranteed
 recipient credit at the quoted state/context: compare `received >= amount_out`,
 not equality. For Buy it equals the target; actual xStock credit may be higher.
 Read-only quotes omit execution friction. Measure funding received by your router
-before quoting/passing input; see the [funding example](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#funding-through-an-aggregator).
+before quoting/passing input; see the [funding rules](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#funding-through-an-aggregator).
 Share floors, xStock dust and direct/Buy rounding are included. For calldata and
 slippage protection, see the [settlement guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#quotes-limits-and-settlement).
 
@@ -153,13 +120,13 @@ cargo run --locked --example subscribe
 cargo test --locked
 ```
 
-Tests check 32,760 execution cases against the newly compiled model-3 contract
-on a local Monad fork, plus 25,896 historical read-only cases and 200 blocks of
-event replay with a test-only model identity migration. Historical expected
-results remain unchanged and do not validate the new defense. Tests also cover
-subscription ordering, reorgs, finalized stored-multiplier events, rejection of
-invalid multiplier values and unchanged multipliers in log-free blocks.
+Tests compare all 272 directed pairs in the deployed 17-token registry against
+contract results and replay finalized blocks against independently read
+snapshots. They also cover subscription ordering, reorgs, stored-multiplier
+updates, invalid values and no RPC reads after initialization, alongside the
+historical quote and settlement corpus.
 [Fixtures and reproduction instructions](https://github.com/thogard785/thog-amm-integration-guide#verification).
+
 When upgrading from 0.5.0, remove multiplier-map arguments from `on_head`,
 `apply_block` and `apply_owned_block`. `EventDrivenSdk` no longer retains a reader
 or has a reader type parameter. `with_reader` still accepts a custom reader for
