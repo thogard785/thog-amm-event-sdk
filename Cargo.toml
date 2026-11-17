@@ -11,8 +11,7 @@ readme = "README.md"
 repository = "https://github.com/thogard785/thog-amm-event-sdk"
 
 [dependencies]
-# Becomes `tag = "v0.7.0"` once the polling SDK release is tagged.
-thogamm = { git = "https://github.com/thogard785/thog-amm-poll-sdk", branch = "claude/aggregator-review" }
+thogamm = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.7.0" }
 futures-util = { version = "0.3.31", features = ["sink"] }
 serde_json = "1.0"
 tokio = { version = "1.48", features = ["net", "time"] }
