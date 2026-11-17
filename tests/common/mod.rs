@@ -1,296 +1,195 @@
+//! Fixtures recorded from the contract, shared by every test.
+//!
+//! Each fixture holds snapshots (the return data of `getPoolData`, plus each
+//! xStock's shares and multiplier) and, per snapshot, calls with the result
+//! the contract gave. Tests compare this crate's result with the contract's.
 #![allow(dead_code)]
-use alloy_sol_types::{sol, SolCall};
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
+use serde_json::Value;
+use std::{collections::BTreeMap, io::Read};
+use thogamm::{
+    abi::{self, SolCall},
+    layout, Address, Bytes, Pool, Snapshot, XStock, B256, U256,
 };
-use thogamm_model::{abi, Address, BlockHeader, Bytes, PoolModel, PoolState, RpcLog, B256, U256};
 
-sol! {
-    struct Sample { uint8 kind; uint8 inputIndex; uint8 outputIndex; uint256 amount; uint256 gasPrice; bool fastLaneHot; bool success; bytes result; }
-    struct SampleSet { bytes snapshot; Sample[] quotes; }
-    struct CapturedLog { bytes32[] topics; bytes data; address emitter; }
-    struct EventSet { bytes beforeState; bytes afterState; CapturedLog[] logs; }
-    struct Fixture { address proxy; uint256 baseFee; SampleSet[] samples; EventSet[] events; bytes[] singleTokenPages; }
-    struct ContractFraction { uint256 numerator; uint256 denominator; }
-    struct Trade { uint256 calculatedAmount; uint256 gasUsed; ContractFraction marginalPriceAfterTrade; }
+pub fn fixture(name: &str) -> Value {
+    serde_json::from_slice(&gunzip(name)).unwrap()
 }
-pub fn fixture() -> Fixture {
-    use std::io::Read;
-    let read = |data: &[u8]| {
-        let mut bytes = Vec::new();
-        flate2::read::GzDecoder::new(data)
-            .read_to_end(&mut bytes)
-            .unwrap();
-        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-    };
-    let quotes = read(include_bytes!("deployed-v8.json.gz"));
-    let events = read(include_bytes!("events-v8.json.gz"));
-    let normalize = |encoded: &serde_json::Value| {
-        let bytes: Bytes = encoded.as_str().unwrap().parse().unwrap();
-        let mut p = page(&bytes);
-        p.parentBlockHash = hash(p.blockNumber.to::<u64>() - 1, 0);
-        Bytes::from(abi::getPoolDataCall::abi_encode_returns(&p))
-    };
-    let blocks = events["blocks"].as_array().unwrap();
-    Fixture {
-        proxy: quotes["proxy"].as_str().unwrap().parse().unwrap(),
-        baseFee: quotes["snapshots"][0]["baseFeePerGas"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap(),
-        samples: quotes["snapshots"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|b| SampleSet {
-                snapshot: normalize(&b["snapshot"]),
-                quotes: b["cases"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|c| Sample {
-                        kind: match c["method"].as_str().unwrap() {
-                            "quote" => 0,
-                            "price" => 1,
-                            "limits" => 2,
-                            _ => unreachable!(),
-                        },
-                        inputIndex: c["inputIndex"].as_u64().unwrap() as u8,
-                        outputIndex: c["outputIndex"].as_u64().unwrap() as u8,
-                        amount: c["amount"].as_str().unwrap().parse().unwrap(),
-                        gasPrice: U256::ZERO,
-                        fastLaneHot: false,
-                        success: c["success"].as_bool().unwrap(),
-                        result: c["result"].as_str().unwrap_or("0x").parse().unwrap(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-        events: blocks
-            .windows(2)
-            .map(|pair| EventSet {
-                beforeState: normalize(&pair[0]["snapshot"]),
-                afterState: normalize(&pair[1]["snapshot"]),
-                logs: pair[1]["logs"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|l| CapturedLog {
-                        emitter: l["address"].as_str().unwrap().parse().unwrap(),
-                        data: l["data"].as_str().unwrap().parse().unwrap(),
-                        topics: serde_json::from_value(l["topics"].clone()).unwrap(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-        singleTokenPages: Vec::new(),
-    }
+
+pub fn gunzip(name: &str) -> Vec<u8> {
+    let path = format!(
+        "{}/fixtures/{name}",
+        env!("CARGO_MANIFEST_DIR")
+            .trim_end_matches("/model")
+            .to_owned()
+            + "/tests"
+    );
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(
+        std::fs::File::open(&path).unwrap_or_else(|e| panic!("{path}: {e}")),
+    )
+    .read_to_end(&mut bytes)
+    .unwrap();
+    bytes
 }
-pub fn page(bytes: &Bytes) -> abi::PoolData {
-    historical_page(abi::getPoolDataCall::abi_decode_returns_validate(bytes).unwrap())
+
+pub fn address(value: &Value) -> Address {
+    value.as_str().unwrap().parse().unwrap()
 }
-/// Reuse immutable model-2 captures for unchanged read-only and event semantics.
-/// This test-only migration changes the model byte, never expected quote results.
-/// Execution-policy tests use separately captured model-3 contract outputs.
-pub fn historical_page(mut p: abi::PoolData) -> abi::PoolData {
-    let word = p.words.iter_mut().find(|w| w.slot == 8).unwrap();
-    let version = (word.value >> 176usize) & U256::from(255);
-    assert!(version == U256::from(2) || version == U256::from(3));
-    word.value = (word.value & !(U256::from(255) << 176usize)) | (U256::from(3) << 176usize);
-    p
+pub fn uint(value: &Value) -> U256 {
+    value.as_str().unwrap().parse().unwrap()
 }
-pub fn hash(number: u64, branch: u8) -> B256 {
+pub fn bytes(value: &Value) -> Bytes {
+    value.as_str().unwrap_or("0x").parse().unwrap()
+}
+
+/// The pool data of one recorded snapshot. Captures made before pricing model
+/// 3 differ from it only in how execution is surcharged, so they are relabeled
+/// and reused for everything else.
+pub fn pool_data(entry: &Value) -> abi::PoolData {
+    let mut data =
+        abi::getPoolDataCall::abi_decode_returns_validate(&bytes(&entry["snapshot"])).unwrap();
+    let format = data
+        .words
+        .iter_mut()
+        .find(|w| w.slot == layout::FORMAT.slot)
+        .unwrap();
+    let model = U256::from(0xff) << (layout::FORMAT.offset + 16);
+    format.value = (format.value & !model) | (U256::from(3) << (layout::FORMAT.offset + 16));
+    data
+}
+
+pub fn xstocks(entry: &Value) -> BTreeMap<Address, XStock> {
+    serde_json::from_value(entry["shareBalances"].clone()).unwrap()
+}
+
+pub fn snapshot(pool: Address, entry: &Value) -> Snapshot {
+    snapshot_from(pool, pool_data(entry), &xstocks(entry))
+}
+
+pub fn snapshot_from(
+    pool: Address,
+    data: abi::PoolData,
+    xstocks: &BTreeMap<Address, XStock>,
+) -> Snapshot {
+    Snapshot::from_pool_data(pool, data, |token| xstocks.get(&token).cloned()).unwrap()
+}
+
+pub fn pool(pool: Address, entry: &Value) -> Pool {
+    Pool::new(snapshot(pool, entry)).unwrap()
+}
+
+/// The 17-token pool as deployed, read at one block.
+pub fn deployed() -> (Value, Pool) {
+    let f = fixture("deployed-stored-multipliers.json.gz");
+    let pool = pool(address(&f["proxy"]), &f["snapshots"][0]);
+    (f, pool)
+}
+
+/// A deterministic stand-in for a block hash.
+pub fn hash(number: u64) -> B256 {
     let mut bytes = [0u8; 32];
-    bytes[0] = branch;
     bytes[24..].copy_from_slice(&number.to_be_bytes());
     B256::from(bytes)
 }
-pub fn header(number: u64, base_fee: U256) -> BlockHeader {
-    BlockHeader {
-        number,
-        hash: hash(number, 0),
-        parent_hash: hash(number - 1, 0),
-        base_fee_per_gas: base_fee,
+
+/// A node that answers the snapshot call from one recorded snapshot.
+pub mod node {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    use thogamm::{
+        rpc::{BlockId, EthCall, MULTICALL3},
+        Error, Result, WMON,
+    };
+
+    #[derive(Clone)]
+    pub struct Node {
+        pub pool: Address,
+        pub state: Arc<Mutex<(abi::PoolData, BTreeMap<Address, XStock>)>>,
+        pub requests: Arc<AtomicUsize>,
+        pub fail: Arc<Mutex<bool>>,
     }
-}
-pub fn model(proxy: Address, base_fee: U256, bytes: &Bytes) -> PoolModel {
-    let p = page(bytes);
-    let h = header(p.blockNumber.to::<u64>(), base_fee);
-    PoolModel::new(PoolState::from_pages(proxy, h, vec![p.clone()], shares_for(&p)).unwrap())
-        .unwrap()
-}
-pub fn logs(event: &EventSet, base_fee: U256) -> Vec<RpcLog> {
-    let p = page(&event.afterState);
-    let h = header(p.blockNumber.to::<u64>(), base_fee);
-    event
-        .logs
-        .iter()
-        .enumerate()
-        .map(|(i, l)| RpcLog {
-            address: l.emitter,
-            topics: l.topics.clone(),
-            data: l.data.clone(),
-            block_hash: h.hash,
-            block_number: h.number,
-            transaction_index: 0,
-            log_index: i as u64,
-            removed: false,
-        })
-        .collect()
-}
-#[derive(Default)]
-pub struct Chain {
-    pub head: u64,
-    pub headers: BTreeMap<u64, BlockHeader>,
-    pub states: BTreeMap<B256, abi::PoolData>,
-    pub calls: Vec<(thogamm_model::rpc::CallBlock, Bytes)>,
-    pub fail_calls: bool,
-}
-#[derive(Clone, Default)]
-pub struct MockRpc(pub Arc<Mutex<Chain>>);
-impl MockRpc {
-    pub fn insert(&self, p: abi::PoolData, base_fee: U256) {
-        let h = header(p.blockNumber.to::<u64>(), base_fee);
-        let mut c = self.0.lock().unwrap();
-        c.head = h.number;
-        c.states.insert(h.hash, p);
-        c.headers.insert(h.number, h);
-    }
-    pub fn from_events(f: &Fixture) -> Self {
-        let rpc = Self::default();
-        rpc.insert(page(&f.events[0].beforeState), f.baseFee);
-        for event in &f.events {
-            rpc.insert(page(&event.afterState), f.baseFee);
-        }
-        rpc.0.lock().unwrap().head = page(&f.events[0].beforeState).blockNumber.to::<u64>();
-        rpc
-    }
-    pub fn call_count(&self) -> usize {
-        self.0.lock().unwrap().calls.len()
-    }
-}
-#[async_trait::async_trait]
-impl thogamm_model::rpc::ChainReader for MockRpc {
-    async fn header(
-        &self,
-        block: thogamm_model::rpc::CallBlock,
-    ) -> thogamm_model::Result<BlockHeader> {
-        use thogamm_model::rpc::CallBlock;
-        let c = self.0.lock().unwrap();
-        let h = match block {
-            CallBlock::Hash(hash) => c.headers.values().find(|h| h.hash == hash).unwrap(),
-            CallBlock::Number(number) => &c.headers[&number],
-            _ => &c.headers[&c.head],
-        };
-        Ok(h.clone())
-    }
-    async fn calls(
-        &self,
-        calls: Vec<(Address, Bytes)>,
-        block: thogamm_model::rpc::CallBlock,
-    ) -> thogamm_model::Result<Vec<Bytes>> {
-        use thogamm_model::rpc::CallBlock;
-        let mut c = self.0.lock().unwrap();
-        let hash = match block {
-            CallBlock::Hash(hash) => hash,
-            _ => panic!("all state reads must be hash-pinned"),
-        };
-        let p = c.states[&hash].clone();
-        let shares = shares_for(&p);
-        calls
-            .into_iter()
-            .map(|(to, data)| {
-                c.calls.push((block, data.clone()));
-                if c.fail_calls {
-                    return Err(thogamm_model::Error::Rpc("injected read failure".into()));
-                }
-                let bytes = if data.starts_with(&abi::getPoolDataCall::SELECTOR) {
-                    let call = abi::getPoolDataCall::abi_decode_validate(&data).unwrap();
-                    assert_eq!((call.startTokenIndex, call.stopTokenIndex), (0, 28));
-                    abi::getPoolDataCall::abi_encode_returns(&p)
-                } else if data.starts_with(&abi::sharesOfCall::SELECTOR) {
-                    abi::sharesOfCall::abi_encode_returns(&shares[&to].shares)
-                } else if data.starts_with(&abi::storedMultiplierCall::SELECTOR) {
-                    let token = abi::storedMultiplierCall::abi_decode_validate(&data)
-                        .unwrap()
-                        .token;
-                    abi::storedMultiplierCall::abi_encode_returns(&shares[&token].multiplier)
-                } else {
-                    panic!("unexpected calldata {data}")
-                };
-                Ok(bytes.into())
-            })
-            .collect()
-    }
-}
-pub fn share_images() -> &'static BTreeMap<u64, thogamm_model::ShareBalances> {
-    static IMAGES: std::sync::OnceLock<BTreeMap<u64, thogamm_model::ShareBalances>> =
-        std::sync::OnceLock::new();
-    IMAGES.get_or_init(|| {
-        use std::io::Read;
-        let mut images = BTreeMap::new();
-        for data in [
-            include_bytes!("events-v8.json.gz").as_slice(),
-            include_bytes!("deployed-v8.json.gz").as_slice(),
-        ] {
-            let mut bytes = Vec::new();
-            flate2::read::GzDecoder::new(data)
-                .read_to_end(&mut bytes)
-                .unwrap();
-            let f: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            for b in f
-                .get("blocks")
-                .or_else(|| f.get("snapshots"))
-                .unwrap()
-                .as_array()
-                .unwrap()
-            {
-                let encoded: Bytes = b["snapshot"].as_str().unwrap().parse().unwrap();
-                images.insert(
-                    page(&encoded).blockNumber.to::<u64>(),
-                    serde_json::from_value(b["shareBalances"].clone()).unwrap(),
-                );
+
+    impl Node {
+        pub fn new(pool: Address, entry: &Value) -> Self {
+            Self {
+                pool,
+                state: Arc::new(Mutex::new((pool_data(entry), xstocks(entry)))),
+                requests: Arc::default(),
+                fail: Arc::default(),
             }
         }
-        images
-    })
-}
-pub fn shares_for(p: &abi::PoolData) -> thogamm_model::ShareBalances {
-    // Synthetic publication fixtures advance only block context, retaining the seed holdings.
-    let candidates = share_images();
-    let valid = |shares: &&thogamm_model::ShareBalances| {
-        p.tokens.iter().enumerate().all(|(i, t)| {
-            shares.get(&t.token).is_none_or(|b| {
-                thogamm_model::math::mul_div(
-                    b.shares,
-                    b.multiplier,
-                    thogamm_model::math::pow10(18),
-                    false,
-                )
+        pub fn requests(&self) -> usize {
+            self.requests.load(Ordering::Relaxed)
+        }
+        pub fn set(&self, data: abi::PoolData) {
+            self.state.lock().unwrap().0 = data;
+        }
+        pub fn data(&self) -> abi::PoolData {
+            self.state.lock().unwrap().0.clone()
+        }
+    }
+
+    impl EthCall for Node {
+        async fn eth_call(&self, to: Address, data: Bytes, block: BlockId) -> Result<Bytes> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            if *self.fail.lock().unwrap() {
+                return Err(Error::Rpc("node unavailable".into()));
+            }
+            assert_eq!(to, MULTICALL3);
+            let (data_now, xstocks) = self.state.lock().unwrap().clone();
+            if let BlockId::Number(number) = block {
+                assert_eq!(
+                    U256::from(number),
+                    data_now.blockNumber,
+                    "this node holds one block"
+                );
+            }
+            let calls = abi::aggregate3Call::abi_decode_validate(&data)
                 .unwrap()
-                    == p.portfolioBalances[i]
-            })
-        })
-    };
-    candidates
-        .get(&p.blockNumber.to::<u64>())
-        .filter(valid)
-        .or_else(|| candidates.values().find(valid))
-        .expect("fixture issuer state not found")
-        .clone()
-}
-/// Expected snapshot for the mock reader’s deterministic header.
-pub fn polled_model(proxy: Address, bytes: &Bytes) -> PoolModel {
-    PoolModel::from_snapshot(
-        proxy,
-        page(bytes),
-        Some(hash(page(bytes).blockNumber.to::<u64>(), 0)),
-        shares_for(&page(bytes)),
-    )
-    .unwrap()
-}
-pub fn model_header(model: &PoolModel) -> BlockHeader {
-    model.state().block.clone().try_into().unwrap()
+                .calls;
+            let results = calls
+                .iter()
+                .map(|call| {
+                    let selector: [u8; 4] = call.callData[..4].try_into().unwrap();
+                    let (success, output) = if selector == abi::getPoolDataCall::SELECTOR {
+                        assert_eq!(call.target, self.pool);
+                        (true, abi::getPoolDataCall::abi_encode_returns(&data_now))
+                    } else if selector == abi::storedMultiplierCall::SELECTOR {
+                        assert_eq!(
+                            call.target, self.pool,
+                            "the multiplier is read from the pool"
+                        );
+                        let token = abi::storedMultiplierCall::abi_decode_validate(&call.callData)
+                            .unwrap()
+                            .token;
+                        let multiplier = xstocks.get(&token).map_or(U256::ZERO, |x| x.multiplier);
+                        (
+                            true,
+                            abi::storedMultiplierCall::abi_encode_returns(&multiplier),
+                        )
+                    } else if selector == abi::sharesOfCall::SELECTOR {
+                        assert!(call.allowFailure, "ordinary tokens do not have sharesOf");
+                        match xstocks.get(&call.target) {
+                            Some(xstock) => {
+                                (true, abi::sharesOfCall::abi_encode_returns(&xstock.shares))
+                            }
+                            // WMON's fallback accepts any call and returns nothing.
+                            None if call.target == WMON => (true, Vec::new()),
+                            None => (false, Vec::new()),
+                        }
+                    } else {
+                        panic!("unexpected call {}", call.callData)
+                    };
+                    abi::CallResult {
+                        success,
+                        returnData: output.into(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok(abi::aggregate3Call::abi_encode_returns(&results).into())
+        }
+    }
 }
