@@ -1,134 +1,121 @@
 # ThogAMM event SDK
 
-Keep an in-memory ThogAMM quote model current through Monad subscriptions.
-Version **0.6.1** supports **schema 8 / wire 8 / model 3** with pool-stored
-xStock multipliers and the expanded 17-token registry. The nine unwrapped
-xStocks are SPYx, QQQx, EWYx, NVDAx, TSLAx, SMHx, SPCXx, MUx and SKHYx, all
-with 18 decimals. [Token addresses](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
+Quote [ThogAMM](https://github.com/thogard785/thog-amm-integration-guide) in
+your own process, kept current by a WebSocket subscription. The SDK reads the
+pool once over HTTP, then follows it block by block from logs, with no further
+reads.
 
-Quote calculations are synchronous and make no network calls. The polling SDK
-reads each multiplier from the pool's `storedMultiplier(token)`; the event
-SDK applies `MakerMultiplierUpdated` after its initial snapshot. Issuer changes
-alone do not change the model's stored values.
+- Network: Monad mainnet, chain ID 143
+- Pool: `0x80c74517BCC2D67fFE02D3ED886796272F647210`
+- Supports implementation `0xb108a1daf3c9ba52778b97a15ebdfa3f6f59b506`
+- Needs a Monad HTTP endpoint and a Monad WebSocket endpoint that serves the
+  [`monadNewHeads`](https://docs.monad.xyz/reference/json-rpc/overview#websocket-subscriptions)
+  subscription
+- Rust 1.88 or later
 
-- Monad mainnet, chain ID **143**.
-- Pool: `0x80c74517BCC2D67fFE02D3ED886796272F647210`.
-- HTTP RPC plus a WebSocket endpoint supporting `logs` and `monadNewHeads`.
-- Rust **1.88+**, Cargo resolver **3**, Tokio. Commit your application's lockfile.
+New to ThogAMM? Read the
+[integration guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md)
+first. Quoting is the same as in the
+[polling SDK](https://github.com/thogard785/thog-amm-poll-sdk#what-you-get),
+which is simpler to run if one HTTP request per refresh suits you.
 
-Use this release with implementation
-`0xb108a1daf3c9ba52778b97a15ebdfa3f6f59b506`. SDK 0.5.0 uses issuer
-multipliers and is incompatible; 0.6.0 already supports stored multipliers.
-The state format remains 8/8/3, so verify implementation compatibility after
-an upgrade and load a fresh snapshot.
-
-## Install and subscribe
+## Use it
 
 ```toml
 [dependencies]
-event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.6.1" }
+thogamm-events = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.7.0" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ```rust
-use event_driven_sdk::{Address, Config, EventDrivenSdk, Result, U256};
+use thogamm_events::{Subscriber, TxContext, U256};
 
-async fn follow_quotes(
-    http: &str, ws: &str, pool: Address, token_in: Address, token_out: Address,
-    amount_in: U256, effective_gas_price: U256,
-) -> Result<()> {
-    let mut sdk = EventDrivenSdk::connect(http, ws, pool, Config::default()).await?;
-    loop {
-        match sdk.model().quote_execution_exact_input(
-            token_in, token_out, amount_in, effective_gas_price,
-        ) {
-            Ok(q) => println!("{}", q.amount_out),
-            Err(e) => eprintln!("quote unavailable: {e}"),
-        }
-        sdk.next_update().await?;
+let mut subscriber = Subscriber::connect(http_url, ws_url, pool_address).await?;
+loop {
+    // Price the swap in the block it should land in.
+    let read = subscriber.pool();
+    let pool = read.at_block(read.block_number() + 2, read.base_fee())?;
+    if let Ok(pair) = pool.pair(usdc, weth) {
+        let quote = pair.maker_quote_exact_input(amount_in)?; // makerQuoteExactInput
+        let swap = pair.maker_swap_exact_input(amount_in, tx)?; // makerSwapExactInput
     }
+    subscriber.next_update().await?; // the next finalized block
 }
 ```
 
-`connect()` subscribes first, then loads pool state, physical shares and pool-stored
-multipliers at one finalized block hash. `next_update()` replays complete
-finalized blocks, including `MakerMultiplierUpdated`, without RPC reads.
-Use `model.state().block.number` and `.hash` to identify the published state;
-it can trail the proposed head. Keep consuming updates even when a quote rejects.
-Active listings are dynamic; share accounting uses the contract's
-[nine compiled xStock addresses](https://github.com/thogard785/thog-amm-poll-sdk/blob/v0.6.1/model/src/shares.rs).
-Listing another of those nine needs no model change; extending the contract's
-xStock catalog requires a matching SDK release.
-
-## Quotes and settlement
-
-The model is shared with the [polling SDK](https://github.com/thogard785/thog-amm-poll-sdk#quote-methods).
-It provides `quote_exact_input`, `quote_execution_exact_input`,
-`quote_exact_output`, `limits` and `marginal_price`. For several sizes, use
-`model.prepare(token_in, token_out)?` and quote the resulting pair. All amounts
-are raw `U256` token units. Rebuild prepared pairs after each update.
-
-Execution methods model an ordinary external caller/recipient without extra
-fees. Pass the transaction's effective gas price. Defaults assume a cold
-AuctionHandler; the `*_with_context` variants accept explicit account warmth.
-Read-only quotes use 90% cap thresholds; execution uses full settlement caps.
-Execution output also depends on the block base fee and whether prices were
-updated in the execution block. For EIP-1559, effective gas price is
-`min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`. The SDK includes these
-adjustments and price-age widening; see the
-[exact rules](https://github.com/thogard785/thog-amm-integration-guide/blob/main/REFERENCE.md#exact-output-marginal-prices-and-settlement).
-Simulate the full settlement route with its actual fee and account-warmth context.
-
-`Quote.amount_in` is the amount passed to Thog. Execution `amount_out` is guaranteed
-recipient credit at the quoted state/context: compare `received >= amount_out`,
-not equality. For Buy it equals the target; actual xStock credit may be higher.
-Read-only quotes omit execution friction. Measure funding received by your router
-before quoting/passing input; see the [funding rules](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#funding-through-an-aggregator).
-Share floors, xStock dust and direct/Buy rounding are included. For calldata and
-slippage protection, see the [settlement guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#quotes-limits-and-settlement).
-
-`at_block` changes age and execution context without fetching new inventory, policy or
-stored multipliers. Independent quotes do not simulate successive fills.
-
-## Errors and custom streams
-
-A disconnect, missing block/log or malformed publication
-returns an error and preserves the last published snapshot. Reconnect explicitly
-with `connect()`. A registry change returns `Error::RegistryChanged`; reconnect
-and rebuild prepared pairs. On `ContractUpgraded` or an unsupported format,
-verify compatibility before using the matching release.
-
-`EventSynchronizer::from_model` accepts a snapshot with a known finalized hash.
-Feed `on_log` and `on_head(header, commitment)` in socket order. Complete
-finalized ancestry is applied atomically, with the stored multiplier updates
-from its logs. Proposed/Voted/Verified heads do not publish model changes. The
-reducer performs no I/O; `pending_headers` exposes ancestry for custom consumers.
-
-`model::events::log_filters(pool, wmon)` covers ordinary transfers, xStock
-`TransferShares`, WMON and pool checkpoints. Use one ordered Monad connection,
-including all commitment stages: each subsequent header closes the previous
-log frame. Generic Ethereum `newHeads` does not establish this completeness.
-Forced native transfers require account-state data or a fresh snapshot.
-
-## Example and verification
-
-[examples/subscribe.rs](examples/subscribe.rs) reads `THOGAMM_HTTP_RPC`,
-`THOGAMM_WS_RPC`, `THOGAMM_PROXY`, `TOKEN_IN`, `TOKEN_OUT`, `AMOUNT_IN` and
-`EFFECTIVE_GAS_PRICE_WEI`:
+[examples/subscribe.rs](examples/subscribe.rs) is a complete program that
+reconnects when the subscription ends:
 
 ```sh
-cargo run --locked --example subscribe
-cargo test --locked
+MONAD_RPC=https://rpc.monad.xyz MONAD_WS=wss://rpc.monad.xyz \
+TOKEN_IN=0x754704Bc059F8C67012fEd69BC8A327a5aafb603 \
+TOKEN_OUT=0xEE8c0E9f1BFFb4Eb878d8f15f368A02a35481242 \
+AMOUNT_IN=100000000 cargo run --example subscribe
 ```
 
-Tests compare all 272 directed pairs in the deployed 17-token registry against
-contract results and replay finalized blocks against independently read
-snapshots. They also cover subscription ordering, reorgs, stored-multiplier
-updates, invalid values and no RPC reads after initialization, alongside the
-historical quote and settlement corpus.
-[Fixtures and reproduction instructions](https://github.com/thogard785/thog-amm-integration-guide#verification).
+## How it stays correct
 
-When upgrading from 0.5.0, remove multiplier-map arguments from `on_head`,
-`apply_block` and `apply_owned_block`. `EventDrivenSdk` no longer retains a reader
-or has a reader type parameter. `with_reader` still accepts a custom reader for
-the initial snapshot. Reconnect after the contract upgrade with this release.
+`subscriber.pool()` is the pool as of the latest **finalized** block the SDK
+has followed. The chain's head is a block or two ahead of it, so evaluate
+quotes at the block you expect to trade in with `pool.at_block(..)`.
+
+Following from logs is exact only if no log is missed, so the SDK is strict:
+
+- It applies a block only once it is finalized and all of its logs have
+  arrived. Proposed blocks that are never finalized change nothing.
+- It stops at the first sign of a gap: a closed or silent connection (10
+  seconds by default, `set_stall_timeout`), a block it did not see proposed, a
+  log that does not fit the state. `next_update()` then returns an error, and
+  keeps returning one.
+- It stops when a token is listed or retired (`Error::RegistryChanged`) and
+  when the pool is upgraded (`Error::ContractUpgraded`).
+
+After an error, connect again; that reads a fresh snapshot. After
+`ContractUpgraded`, first check that this release supports the new
+implementation.
+
+The SDK relies on the order in which a Monad node delivers one connection's
+notifications: a block's head, then all of that block's logs, then the next
+head. Use one connection to one node, not a load balancer that can interleave
+several.
+
+## Your own subscription
+
+If you already run a Monad subscription, use `Follower` and feed it yourself:
+
+```rust
+let mut follower = Follower::new(snapshot)?;   // a finalized block, hash known
+follower.on_head(header, CommitState::Proposed)?;
+follower.on_log(log)?;
+if follower.on_head(header, CommitState::Finalized)? {
+    let pool = follower.pool();                // advanced
+}
+```
+
+Subscribe to `thogamm::events::log_filters(pool_address)` and to
+`monadNewHeads`, on one connection, heads last. Feed every notification in the
+order it arrives, including `Voted` and `Verified` heads.
+
+## Tests
+
+```sh
+cargo test --release
+```
+
+The tests follow 50 recorded blocks of the deployed pool through every commit
+state and compare the result with the state read from the chain at each block,
+over a real WebSocket as well as directly. They cover reordered and duplicated
+logs, repeated and abandoned proposals, gaps, stalls, upgrades and listing
+changes. The pricing arithmetic is tested in the
+[polling SDK](https://github.com/thogard785/thog-amm-poll-sdk#tests), whose
+`thogamm` crate this SDK uses.
+
+One more test follows the deployed pool for 60 blocks and compares with the
+chain:
+
+```sh
+MONAD_RPC=https://rpc.monad.xyz MONAD_WS=wss://rpc.monad.xyz \
+cargo test --release --test live -- --ignored --nocapture
+```
+
 [MIT license](LICENSE).

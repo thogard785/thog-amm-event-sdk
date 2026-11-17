@@ -1,31 +1,32 @@
-//! Quote ThogAMM locally in your aggregator using state kept up to date by events.
-//! Events update pool/share state and executor-stored xStock multipliers.
-//! Published snapshots represent complete finalized blocks on Monad.
+//! Keep a ThogAMM pool current from a Monad WebSocket subscription.
+//!
+//! [`Subscriber`] reads the pool once, then follows it block by block from
+//! logs alone. [`Follower`] is the same logic without the socket, for callers
+//! that already run a Monad subscription.
+//!
+//! Quoting is in the [`thogamm`] crate, re-exported here.
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::collections::{btree_map::Entry, BTreeMap, VecDeque};
-pub use thogamm_model::{self as model, Address, Error, PoolModel, Result, U256};
-use thogamm_model::{
-    events::{apply_owned_block, log_filters},
-    rpc::{snapshot, CallBlock, ChainReader, HttpRpc},
-    BlockHeader, RpcLog, B256,
+use std::{
+    collections::{btree_map::Entry, BTreeMap, VecDeque},
+    time::Duration,
+};
+pub use thogamm::{
+    self,
+    events::{BlockHeader, Log},
+    rpc::{EthCall, HttpRpc},
+    Address, Error, Pair, Pool, Quote, Rejection, Result, Swap, TxContext, B256, U256,
+};
+use thogamm::{
+    events::{apply_block, log_filters},
+    rpc::{read_snapshot, BlockId},
+    Snapshot,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-#[derive(Clone, Debug)]
-pub struct Config {
-    /// Wrapped MON token used to track pool balances. Defaults to Monad mainnet WMON.
-    pub wmon: Address,
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            wmon: alloy_primitives::address!("3bd359c1119da7da1d913d1c4d2b7c461115433a"),
-        }
-    }
-}
+/// The stage a Monad block has reached, as `monadNewHeads` reports it in
+/// `commitState`. <https://docs.monad.xyz/reference/json-rpc/overview#websocket-subscriptions>
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitState {
     Proposed,
@@ -33,395 +34,391 @@ pub enum CommitState {
     Finalized,
     Verified,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Update {
-    pub block: BlockHeader,
-    pub blocks: u64,
-}
+
 struct PendingBlock {
     header: BlockHeader,
-    logs: BTreeMap<(u64, u64), RpcLog>,
+    logs: BTreeMap<(u64, u64), Log>,
+    /// Set once the next head arrives: every log of this block has been seen.
     complete: bool,
 }
 
-/// A reducer for one ordered Monad connection: four `logs` filters
-/// plus `monadNewHeads`. A subsequent commitment header closes the prior log
-/// frame. Only finalized ancestry is published; abandoned proposals are discarded.
-/// Feed notifications in socket order, including Voted/Verified heads.
+/// Follows the pool through finalized blocks, given heads and logs in the
+/// order one Monad WebSocket connection delivers them.
 ///
-/// The source must use Monad's header-before-logs, whole-block serialization
-/// (monad-rpc/src/websocket/handler.rs::handle_notification). Generic Ethereum
-/// newHeads/logs streams do not provide this completion boundary.
-pub struct EventSynchronizer {
-    model: PoolModel,
+/// A Monad node sends a block's head, then all of that block's logs, before
+/// the next head. That ordering is what tells the follower a block's logs are
+/// complete; an Ethereum-style `newHeads` subscription does not give it.
+/// Proposed blocks are held back, and applied only once finalized.
+pub struct Follower {
+    pool: Pool,
     pending: BTreeMap<B256, PendingBlock>,
-    active: Option<B256>,
+    /// The proposed block whose logs are arriving now.
+    receiving: Option<B256>,
     failed: bool,
 }
-impl EventSynchronizer {
-    /// Use your own finalized pool snapshot and subsequent event stream.
-    /// The snapshot must have its known block hash. This constructor performs no I/O.
-    pub fn from_model(model: PoolModel) -> Result<Self> {
-        if model.state().block.hash.is_none() {
-            return Err(Error::InvalidData(
-                "event seed requires a known finalized block hash".into(),
+
+impl Follower {
+    /// Start from a snapshot of a finalized block whose hash is known.
+    pub fn new(snapshot: Snapshot) -> Result<Self> {
+        if snapshot.block.hash.is_none() {
+            return Err(Error::InvalidSnapshot(
+                "following needs the snapshot's block hash".into(),
             ));
         }
-        model.state().validate()?;
         Ok(Self {
-            model,
+            pool: Pool::new(snapshot)?,
             pending: BTreeMap::new(),
-            active: None,
+            receiving: None,
             failed: false,
         })
     }
-    pub fn model(&self) -> &PoolModel {
-        &self.model
+
+    /// The pool as of the latest finalized block that was followed.
+    pub fn pool(&self) -> &Pool {
+        &self.pool
     }
-    pub fn on_log(&mut self, log: RpcLog) -> Result<()> {
+
+    /// Feed one log. After an error the follower stays failed: start again
+    /// from a fresh snapshot.
+    pub fn on_log(&mut self, log: Log) -> Result<()> {
+        self.guard(|follower| follower.add_log(log))
+    }
+
+    /// Feed one head. Returns true when the pool advanced.
+    pub fn on_head(&mut self, header: BlockHeader, state: CommitState) -> Result<bool> {
+        self.guard(|follower| follower.add_head(header, state))
+    }
+
+    fn guard<T>(&mut self, step: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         if self.failed {
             return Err(Error::Discontinuous);
         }
-        let result = self.apply_log(log);
-        if result.is_err() {
-            self.failed = true;
-        }
+        let result = step(self);
+        self.failed = result.is_err();
         result
     }
-    fn apply_log(&mut self, log: RpcLog) -> Result<()> {
+
+    fn add_log(&mut self, log: Log) -> Result<()> {
         if log.removed {
             return Err(Error::Discontinuous);
         }
-        if log.block_number <= self.model.state().block.number {
+        if log.block_number <= self.pool.snapshot().block.number {
             return Ok(());
         }
-        if self.active != Some(log.block_hash) {
-            return Err(Error::Discontinuous);
-        }
         let block = self
-            .pending
-            .get_mut(&log.block_hash)
+            .receiving
+            .filter(|hash| *hash == log.block_hash)
+            .and_then(|hash| self.pending.get_mut(&hash))
+            .filter(|block| !block.complete && block.header.number == log.block_number)
             .ok_or(Error::Discontinuous)?;
-        if block.complete || block.header.number != log.block_number {
-            return Err(Error::Discontinuous);
-        }
-        let position = (log.transaction_index, log.log_index);
-        match block.logs.entry(position) {
-            Entry::Occupied(previous) if previous.get() != &log => {
-                return Err(Error::InvalidData("conflicting subscription logs".into()));
-            }
-            Entry::Occupied(_) => {}
-            Entry::Vacant(entry) => {
-                entry.insert(log);
+        // The four filters overlap, so the same log can arrive more than once.
+        match block.logs.entry((log.transaction_index, log.log_index)) {
+            Entry::Occupied(seen) if seen.get() != &log => Err(Error::Discontinuous),
+            Entry::Occupied(_) => Ok(()),
+            Entry::Vacant(slot) => {
+                slot.insert(log);
+                Ok(())
             }
         }
-        Ok(())
     }
-    /// Headers needed to finalize this ancestry, in increasing order.
-    pub fn pending_headers(&self, header: &BlockHeader) -> Result<Vec<BlockHeader>> {
-        let current = &self.model.state().block;
-        let mut path = Vec::new();
-        let mut hash = header.hash;
-        let mut number = header.number;
-        while number > current.number {
-            let block = self.pending.get(&hash).ok_or(Error::Discontinuous)?;
-            if block.header.number != number || (number == header.number && block.header != *header)
-            {
-                return Err(Error::Discontinuous);
-            }
-            path.push(block.header.clone());
-            hash = block.header.parent_hash;
-            number -= 1;
-        }
-        if header.number >= current.number && Some(hash) != current.hash {
-            return Err(Error::Discontinuous);
-        }
-        path.reverse();
-        Ok(path)
-    }
-    pub fn on_head(
-        &mut self,
-        header: BlockHeader,
-        commitment: CommitState,
-    ) -> Result<Option<Update>> {
-        if self.failed {
-            return Err(Error::Discontinuous);
-        }
-        let result = self.apply_head(header, commitment);
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-    fn apply_head(
-        &mut self,
-        header: BlockHeader,
-        commitment: CommitState,
-    ) -> Result<Option<Update>> {
-        // Monad serializes every prior block's complete set of log filters before
-        // starting this header notification on the same WebSocket connection.
-        if let Some(hash) = self.active.take() {
+
+    fn add_head(&mut self, header: BlockHeader, state: CommitState) -> Result<bool> {
+        // A new head means the block that was receiving logs has them all.
+        if let Some(hash) = self.receiving.take() {
             self.pending
                 .get_mut(&hash)
                 .ok_or(Error::Discontinuous)?
                 .complete = true;
         }
-        let current = &self.model.state().block;
+        let current = &self.pool.snapshot().block;
         if header.number <= current.number {
-            if commitment == CommitState::Finalized
+            let replaced = state == CommitState::Finalized
                 && header.number == current.number
-                && Some(header.hash) != current.hash
-            {
-                return Err(Error::Discontinuous);
-            }
-            return Ok(None);
+                && Some(header.hash) != current.hash;
+            return if replaced {
+                Err(Error::Discontinuous)
+            } else {
+                Ok(false)
+            };
         }
-        if commitment == CommitState::Proposed {
-            self.active = Some(header.hash);
+        match state {
+            CommitState::Proposed => {
+                let block = self
+                    .pending
+                    .entry(header.hash)
+                    .or_insert_with(|| PendingBlock {
+                        header: header.clone(),
+                        logs: BTreeMap::new(),
+                        complete: false,
+                    });
+                if block.header != header {
+                    return Err(Error::Discontinuous);
+                }
+                // A proposal can be sent again; its logs follow again too.
+                block.complete = false;
+                self.receiving = Some(header.hash);
+                Ok(false)
+            }
+            CommitState::Voted | CommitState::Verified => Ok(false),
+            CommitState::Finalized => {
+                self.finalize(&header)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Apply every block from the pool's block up to `header`, or none.
+    fn finalize(&mut self, header: &BlockHeader) -> Result<()> {
+        let current = &self.pool.snapshot().block;
+        let mut chain = Vec::new();
+        let mut hash = header.hash;
+        for number in (current.number + 1..=header.number).rev() {
             let block = self
                 .pending
-                .entry(header.hash)
-                .or_insert_with(|| PendingBlock {
-                    header: header.clone(),
-                    logs: BTreeMap::new(),
-                    complete: false,
-                });
-            if block.header != header {
-                return Err(Error::InvalidData("conflicting proposal header".into()));
-            }
-            // A repeated frame retains its logs; position-based deduplication
-            // prevents replaying transfer deltas twice.
-            block.complete = false;
-            return Ok(None);
+                .get(&hash)
+                .filter(|block| block.complete && block.header.number == number)
+                .ok_or(Error::Discontinuous)?;
+            chain.push(block);
+            hash = block.header.parent_hash;
         }
-        if commitment != CommitState::Finalized {
-            return Ok(None);
+        if Some(hash) != current.hash || chain.first().is_some_and(|tip| tip.header != *header) {
+            return Err(Error::Discontinuous);
         }
-        let path = self.pending_headers(&header)?;
-        for h in &path {
-            if !self.pending[&h.hash].complete {
-                return Err(Error::Discontinuous);
-            }
+        let mut snapshot = self.pool.snapshot().clone();
+        for block in chain.into_iter().rev() {
+            snapshot = apply_block(snapshot, &block.header, block.logs.values())?;
         }
-        let mut next = self.model.state().clone();
-        for h in &path {
-            let block = &self.pending[&h.hash];
-            next = apply_owned_block(next, block.header.clone(), block.logs.values())?;
-        }
-        let update = Update {
-            blocks: header.number - current.number,
-            block: header.clone(),
-        };
-        self.model = PoolModel::new(next)?;
+        self.pool = Pool::new(snapshot)?;
         self.pending
             .retain(|_, block| block.header.number > header.number);
-        Ok(Some(update))
+        Ok(())
     }
 }
 
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
 #[derive(Clone, Copy)]
-enum Subscription {
+enum Feed {
     Logs,
     Heads,
 }
-type Subscriptions = BTreeMap<String, Subscription>;
 
-/// Pool, share and stored multiplier updates come from subscriptions after the
-/// initial snapshot. The steady-state update path performs no RPC reads.
-pub struct EventDrivenSdk {
-    synchronizer: EventSynchronizer,
+/// How long [`Subscriber::next_update`] waits for any message before giving
+/// up on the connection. Monad produces a block about every 0.4 seconds.
+pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A ThogAMM pool read once over HTTP, then followed over a WebSocket.
+pub struct Subscriber {
+    follower: Follower,
     socket: Socket,
-    subscriptions: Subscriptions,
-    queued: VecDeque<Value>,
+    feeds: BTreeMap<String, Feed>,
+    /// Notifications that arrived before the first snapshot was read.
+    backlog: VecDeque<Value>,
+    stall_timeout: Duration,
 }
-impl EventDrivenSdk {
-    /// Connect using Monad HTTP/WebSocket endpoints and the ThogAMM pool address.
-    /// Establishes subscriptions and loads one atomic pool/share/stored-multiplier snapshot.
+
+impl Subscriber {
+    /// Subscribe through a Monad WebSocket endpoint, then read the pool at
+    /// `pool_address` through a Monad HTTP endpoint.
     pub async fn connect(
         http_url: impl Into<String>,
         ws_url: impl AsRef<str>,
-        proxy: Address,
-        config: Config,
+        pool_address: Address,
     ) -> Result<Self> {
-        Self::with_reader(HttpRpc::new(http_url)?, ws_url, proxy, config).await
+        Self::with_rpc(&HttpRpc::new(http_url)?, ws_url, pool_address).await
     }
-}
-impl EventDrivenSdk {
-    /// Use a custom reader for the initial block-pinned snapshot.
-    pub async fn with_reader<R: ChainReader>(
-        reader: R,
+
+    /// As [`Subscriber::connect`], reading the first snapshot through your own RPC client.
+    pub async fn with_rpc(
+        rpc: &impl EthCall,
         ws_url: impl AsRef<str>,
-        proxy: Address,
-        config: Config,
+        pool_address: Address,
     ) -> Result<Self> {
-        let (mut socket, subscriptions, mut queued) = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            subscribe(ws_url.as_ref(), proxy, config.wmon),
+        let timeout = DEFAULT_STALL_TIMEOUT;
+        // Subscribe first, so that no block between the snapshot and the
+        // first notification can be missed.
+        let (mut socket, feeds) = deadline(timeout, subscribe(ws_url.as_ref(), pool_address))
+            .await
+            .ok_or_else(|| Error::Transport("subscribing timed out".into()))??;
+        let mut backlog = VecDeque::new();
+        let start = deadline(
+            timeout,
+            first_finalized_head(&mut socket, &feeds, &mut backlog),
         )
         .await
-        .map_err(|_| Error::Transport("subscription handshake timed out".into()))??;
-        let seed_header = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            let mut min_seed = None;
-            let mut cursor = 0;
-            loop {
-                if cursor == queued.len() {
-                    queued.push_back(read_json(&mut socket).await?);
-                }
-                let value = &queued[cursor];
-                cursor += 1;
-                if let Some((Subscription::Heads, payload)) = notification(value, &subscriptions)? {
-                    let (header, commitment) = parse_head(payload)?;
-                    if commitment == CommitState::Proposed && min_seed.is_none() {
-                        min_seed = Some(header.number);
-                    }
-                    if commitment == CommitState::Finalized
-                        && min_seed.is_some_and(|n| header.number >= n)
-                    {
-                        return Ok::<_, Error>(header);
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(|_| Error::Transport("no finalized subscription checkpoint received".into()))??;
-        let model = snapshot(&reader, proxy, CallBlock::Hash(seed_header.hash)).await?;
-        if model.state().block != seed_header.into()
-            || config.wmon != thogamm_model::state::WMON
-            || !model.state().tokens.iter().any(|t| t.token == config.wmon)
+        .ok_or_else(|| Error::Transport("no finalized block arrived".into()))??;
+        // A finalized block is the only block at its number.
+        let mut snapshot =
+            read_snapshot(rpc, pool_address, BlockId::Number(start.number), &[]).await?;
+        if snapshot.block.parent_hash != start.parent_hash
+            || snapshot.block.base_fee != start.base_fee_per_gas
         {
-            return Err(Error::InvalidData(
-                "seed disagrees with subscription context or WMON configuration".into(),
+            return Err(Error::Rpc(
+                "the HTTP and WebSocket endpoints disagree about the block".into(),
             ));
         }
+        snapshot.block.hash = Some(start.hash);
         Ok(Self {
-            synchronizer: EventSynchronizer::from_model(model)?,
+            follower: Follower::new(snapshot)?,
             socket,
-            subscriptions,
-            queued,
+            feeds,
+            backlog,
+            stall_timeout: timeout,
         })
     }
-    pub fn model(&self) -> &PoolModel {
-        self.synchronizer.model()
+
+    /// Change how long [`Subscriber::next_update`] tolerates a silent connection.
+    pub fn set_stall_timeout(&mut self, timeout: Duration) {
+        self.stall_timeout = timeout;
     }
-    /// Consumes subscriptions and publishes complete finalized blocks.
-    /// Missing events are reported; reconnect explicitly.
-    pub async fn next_update(&mut self) -> Result<Update> {
-        if self.synchronizer.failed {
+
+    /// The pool as of the latest finalized block. Its block is
+    /// `pool().snapshot().block.number`; the chain's head is a block or two
+    /// ahead. Before quoting, move the pool to the block you expect to trade
+    /// in with [`Pool::at_block`].
+    pub fn pool(&self) -> &Pool {
+        self.follower.pool()
+    }
+
+    /// Wait until the pool has advanced to a newer finalized block.
+    ///
+    /// Any error ends the subscription: a missed block cannot be recovered
+    /// from logs. Connect again to continue.
+    pub async fn next_update(&mut self) -> Result<&Pool> {
+        if self.follower.failed {
             return Err(Error::Discontinuous);
         }
-        let result = self.read_update().await;
-        if result.is_err() {
-            self.synchronizer.failed = true;
+        if let Err(error) = self.advance().await {
+            self.follower.failed = true;
+            return Err(error);
         }
-        result
+        Ok(self.follower.pool())
     }
-    async fn read_update(&mut self) -> Result<Update> {
+
+    /// Feed notifications to the follower until one finalizes a newer block.
+    async fn advance(&mut self) -> Result<()> {
         loop {
-            let value = match self.queued.pop_front() {
-                Some(value) => value,
-                None => read_json(&mut self.socket).await?,
+            let message = match self.backlog.pop_front() {
+                Some(message) => message,
+                None => deadline(self.stall_timeout, next_message(&mut self.socket))
+                    .await
+                    .ok_or_else(|| Error::Transport("the subscription went silent".into()))??,
             };
-            if let Some((kind, payload)) = notification(&value, &self.subscriptions)? {
-                match kind {
-                    Subscription::Logs => self.synchronizer.on_log(
-                        serde_json::from_value(payload.clone())
-                            .map_err(|e| Error::Rpc(e.to_string()))?,
-                    )?,
-                    Subscription::Heads => {
-                        let (header, commitment) = parse_head(payload)?;
-                        if let Some(update) = self.synchronizer.on_head(header, commitment)? {
-                            return Ok(update);
-                        }
-                    }
+            let advanced = match notification(&message, &self.feeds)? {
+                (Feed::Logs, log) => {
+                    self.follower.on_log(parse_log(log)?)?;
+                    false
                 }
+                (Feed::Heads, head) => {
+                    let (header, state) = parse_head(head)?;
+                    self.follower.on_head(header, state)?
+                }
+            };
+            if advanced {
+                return Ok(());
             }
         }
     }
 }
-fn parse_head(payload: &Value) -> Result<(BlockHeader, CommitState)> {
-    let header = serde_json::from_value(payload.clone()).map_err(|e| Error::Rpc(e.to_string()))?;
-    let commitment = match payload["commitState"].as_str() {
+
+async fn deadline<T>(limit: Duration, future: impl std::future::Future<Output = T>) -> Option<T> {
+    tokio::time::timeout(limit, future).await.ok()
+}
+
+/// Open the four log subscriptions, then `monadNewHeads`. Heads come last so
+/// that every head seen is followed by all of its block's logs.
+async fn subscribe(url: &str, pool: Address) -> Result<(Socket, BTreeMap<String, Feed>)> {
+    let (mut socket, _) = connect_async(url)
+        .await
+        .map_err(|e| Error::Transport(e.to_string()))?;
+    let mut requests: Vec<(Feed, Value)> = log_filters(pool)
+        .into_iter()
+        .map(|filter| (Feed::Logs, json!(["logs", filter])))
+        .collect();
+    requests.push((Feed::Heads, json!(["monadNewHeads"])));
+    let mut feeds = BTreeMap::new();
+    for (id, (feed, params)) in requests.into_iter().enumerate() {
+        let request =
+            json!({ "jsonrpc": "2.0", "id": id, "method": "eth_subscribe", "params": params });
+        socket
+            .send(Message::Text(request.to_string().into()))
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        // Notifications of earlier subscriptions may arrive before this
+        // reply. They describe blocks older than the first snapshot.
+        let reply = loop {
+            let message = next_message(&mut socket).await?;
+            if message["method"] != "eth_subscription" {
+                break message;
+            }
+        };
+        match reply["result"].as_str() {
+            Some(subscription) if reply["id"] == json!(id) => {
+                feeds.insert(subscription.to_owned(), feed);
+            }
+            _ => return Err(Error::Rpc(format!("eth_subscribe failed: {reply}"))),
+        }
+    }
+    Ok((socket, feeds))
+}
+
+/// Wait for a finalized head that was first seen as a proposal on this
+/// connection, keeping every notification for replay after the snapshot.
+async fn first_finalized_head(
+    socket: &mut Socket,
+    feeds: &BTreeMap<String, Feed>,
+    backlog: &mut VecDeque<Value>,
+) -> Result<BlockHeader> {
+    let mut first_proposal = None;
+    loop {
+        let message = next_message(socket).await?;
+        let head = match notification(&message, feeds)? {
+            (Feed::Heads, head) => Some(parse_head(head)?),
+            (Feed::Logs, _) => None,
+        };
+        backlog.push_back(message);
+        if let Some((header, state)) = head {
+            if state == CommitState::Proposed && first_proposal.is_none() {
+                first_proposal = Some(header.number);
+            }
+            if state == CommitState::Finalized && first_proposal.is_some_and(|n| header.number >= n)
+            {
+                return Ok(header);
+            }
+        }
+    }
+}
+
+fn notification<'a>(
+    message: &'a Value,
+    feeds: &BTreeMap<String, Feed>,
+) -> Result<(Feed, &'a Value)> {
+    let feed = message["params"]["subscription"]
+        .as_str()
+        .and_then(|id| feeds.get(id))
+        .filter(|_| message["method"] == "eth_subscription")
+        .ok_or_else(|| Error::Rpc(format!("unexpected WebSocket message: {message}")))?;
+    Ok((*feed, &message["params"]["result"]))
+}
+
+fn parse_log(log: &Value) -> Result<Log> {
+    serde_json::from_value(log.clone()).map_err(|e| Error::Rpc(e.to_string()))
+}
+
+fn parse_head(head: &Value) -> Result<(BlockHeader, CommitState)> {
+    let state = match head["commitState"].as_str() {
         Some("Proposed") => CommitState::Proposed,
         Some("Voted") => CommitState::Voted,
         Some("Finalized") => CommitState::Finalized,
         Some("Verified") => CommitState::Verified,
-        _ => return Err(Error::Rpc("expected Monad commitState".into())),
+        _ => return Err(Error::Rpc("head without a Monad commitState".into())),
     };
-    Ok((header, commitment))
+    let header = serde_json::from_value(head.clone()).map_err(|e| Error::Rpc(e.to_string()))?;
+    Ok((header, state))
 }
-fn notification<'a>(
-    value: &'a Value,
-    subscriptions: &Subscriptions,
-) -> Result<Option<(Subscription, &'a Value)>> {
-    if let Some(error) = value.get("error") {
-        return Err(Error::Rpc(error.to_string()));
-    }
-    if value["method"] != "eth_subscription" {
-        return Err(Error::Rpc("unexpected WebSocket message".into()));
-    }
-    let id = value["params"]["subscription"]
-        .as_str()
-        .ok_or_else(|| Error::Rpc("missing subscription ID".into()))?;
-    let kind = *subscriptions
-        .get(id)
-        .ok_or_else(|| Error::Rpc("unknown subscription".into()))?;
-    Ok(Some((kind, &value["params"]["result"])))
-}
-async fn subscribe(
-    url: &str,
-    proxy: Address,
-    wmon: Address,
-) -> Result<(Socket, Subscriptions, VecDeque<Value>)> {
-    let (mut socket, _) = connect_async(url)
-        .await
-        .map_err(|e| Error::Transport(e.to_string()))?;
-    let mut requests: Vec<Value> = log_filters(proxy, wmon)
-        .into_iter()
-        .map(|filter| json!(["logs", filter]))
-        .collect();
-    // Register the head stream last, after all log filters are active. This is
-    // essential for using later headers as complete-log boundaries.
-    requests.push(json!(["monadNewHeads"]));
-    let mut subscriptions = BTreeMap::new();
-    let mut queued = VecDeque::new();
-    for (i, params) in requests.into_iter().enumerate() {
-        let kind = if i == 4 {
-            Subscription::Heads
-        } else {
-            Subscription::Logs
-        };
-        socket
-            .send(Message::Text(
-                json!({"jsonrpc":"2.0","id":i+1,"method":"eth_subscribe","params":params})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        loop {
-            let value = read_json(&mut socket).await?;
-            if value["method"] == "eth_subscription" {
-                queued.push_back(value);
-                continue;
-            }
-            if value["id"] != json!(i + 1) {
-                return Err(Error::Rpc("unexpected subscription response".into()));
-            }
-            if let Some(error) = value.get("error") {
-                return Err(Error::Rpc(error.to_string()));
-            }
-            let id = value["result"]
-                .as_str()
-                .ok_or_else(|| Error::Rpc("missing subscription ID".into()))?;
-            if subscriptions.insert(id.to_owned(), kind).is_some() {
-                return Err(Error::Rpc("duplicate subscription ID".into()));
-            }
-            break;
-        }
-    }
-    Ok((socket, subscriptions, queued))
-}
-async fn read_json(socket: &mut Socket) -> Result<Value> {
+
+async fn next_message(socket: &mut Socket) -> Result<Value> {
+    let transport = |e: tokio_tungstenite::tungstenite::Error| Error::Transport(e.to_string());
     loop {
         match socket.next().await {
             Some(Ok(Message::Text(text))) => {
@@ -430,19 +427,15 @@ async fn read_json(socket: &mut Socket) -> Result<Value> {
             Some(Ok(Message::Binary(bytes))) => {
                 return serde_json::from_slice(&bytes).map_err(|e| Error::Rpc(e.to_string()))
             }
-            Some(Ok(Message::Ping(data))) => socket
-                .send(Message::Pong(data))
+            Some(Ok(Message::Ping(payload))) => socket
+                .send(Message::Pong(payload))
                 .await
-                .map_err(|e| Error::Transport(e.to_string()))?,
-            Some(Ok(Message::Pong(_))) => {}
+                .map_err(transport)?,
             Some(Ok(Message::Close(_))) | None => {
-                return Err(Error::Transport(
-                    "subscription closed; explicitly initialize a new client from complete state"
-                        .into(),
-                ))
+                return Err(Error::Transport("the subscription closed".into()))
             }
-            Some(Err(error)) => return Err(Error::Transport(error.to_string())),
             Some(Ok(_)) => {}
+            Some(Err(error)) => return Err(transport(error)),
         }
     }
 }

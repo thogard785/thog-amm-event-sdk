@@ -1,7 +1,7 @@
 [package]
-name = "event-driven-sdk"
-version = "0.6.1"
-description = "Rust SDK for aggregators to quote ThogAMM from event subscriptions"
+name = "thogamm-events"
+version = "0.7.0"
+description = "Keep a ThogAMM pool current from a Monad WebSocket subscription, and quote it locally"
 edition = "2021"
 rust-version = "1.88"
 resolver = "3"
@@ -11,16 +11,13 @@ readme = "README.md"
 repository = "https://github.com/thogard785/thog-amm-event-sdk"
 
 [dependencies]
-thogamm-model = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.6.1" }
-alloy-primitives = "=1.7.3"
+thogamm = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.7.0" }
 futures-util = { version = "0.3.31", features = ["sink"] }
 serde_json = "1.0"
 tokio = { version = "1.48", features = ["net", "time"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
-alloy-sol-types = "=1.7.3"
-async-trait = "0.1.89"
 flate2 = "1.1"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "sync"] }
 
