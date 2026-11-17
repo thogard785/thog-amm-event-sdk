@@ -288,31 +288,34 @@ impl Subscriber {
         if self.follower.failed {
             return Err(Error::Discontinuous);
         }
+        if let Err(error) = self.advance().await {
+            self.follower.failed = true;
+            return Err(error);
+        }
+        Ok(self.follower.pool())
+    }
+
+    /// Feed notifications to the follower until one finalizes a newer block.
+    async fn advance(&mut self) -> Result<()> {
         loop {
             let message = match self.backlog.pop_front() {
                 Some(message) => message,
                 None => deadline(self.stall_timeout, next_message(&mut self.socket))
                     .await
-                    .ok_or_else(|| {
-                        self.follower.failed = true;
-                        Error::Transport("the subscription went silent".into())
-                    })??,
+                    .ok_or_else(|| Error::Transport("the subscription went silent".into()))??,
             };
-            let advanced = match notification(&message, &self.feeds) {
-                Ok((Feed::Logs, log)) => parse_log(log)
-                    .and_then(|log| self.follower.on_log(log))
-                    .map(|()| false),
-                Ok((Feed::Heads, head)) => parse_head(head)
-                    .and_then(|(header, state)| self.follower.on_head(header, state)),
-                Err(error) => Err(error),
-            };
-            match advanced {
-                Ok(true) => return Ok(self.follower.pool()),
-                Ok(false) => {}
-                Err(error) => {
-                    self.follower.failed = true;
-                    return Err(error);
+            let advanced = match notification(&message, &self.feeds)? {
+                (Feed::Logs, log) => {
+                    self.follower.on_log(parse_log(log)?)?;
+                    false
                 }
+                (Feed::Heads, head) => {
+                    let (header, state) = parse_head(head)?;
+                    self.follower.on_head(header, state)?
+                }
+            };
+            if advanced {
+                return Ok(());
             }
         }
     }

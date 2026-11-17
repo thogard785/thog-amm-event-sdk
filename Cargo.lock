@@ -2387,7 +2387,7 @@ dependencies = [
 [[package]]
 name = "thogamm"
 version = "0.7.0"
-source = "git+https://github.com/thogard785/thog-amm-poll-sdk?branch=claude%2Faggregator-review#22a60e5229569f733f22976d8f9682ef75688cc8"
+source = "git+https://github.com/thogard785/thog-amm-poll-sdk?branch=claude%2Faggregator-review#082d220d101dcc2a2458182d1403edcf1a8c12f4"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",

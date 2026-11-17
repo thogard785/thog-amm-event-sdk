@@ -9,7 +9,9 @@ use tokio::{net::TcpListener, sync::mpsc};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 /// A WebSocket server that acknowledges the five subscriptions, then sends
-/// whatever notifications the test hands it. `Value::Null` makes it stall.
+/// whatever notifications the test hands it. `Value::Null` makes it stall, a
+/// string is sent as it is instead of as JSON, and dropping the sender closes
+/// the connection.
 async fn server() -> (
     String,
     mpsc::UnboundedSender<Value>,
@@ -40,10 +42,11 @@ async fn server() -> (
             if notification.is_null() {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
-            socket
-                .send(Message::Text(notification.to_string().into()))
-                .await
-                .unwrap();
+            let text = match &notification {
+                Value::String(raw) => raw.clone(),
+                json => json.to_string(),
+            };
+            socket.send(Message::Text(text.into())).await.unwrap();
         }
         subscriptions
     });
@@ -115,6 +118,45 @@ async fn reads_once_then_follows_finalized_blocks_from_logs_alone() {
     server.abort();
     let subscriptions = server.await;
     assert!(subscriptions.is_err(), "the server was stopped mid-stall");
+}
+
+/// A message that cannot be read might have been a log, and a closed
+/// connection misses every block after it. Either ends the subscription.
+#[tokio::test]
+async fn a_lost_message_ends_the_subscription() {
+    let f = fixture("events-stored-multipliers.json.gz");
+    let blocks = f["blocks"].as_array().unwrap();
+    let pool = address(&f["proxy"]);
+    for unreadable in [true, false] {
+        let node = Node::new(pool, &blocks[0]);
+        let (url, send, _server) = server().await;
+        send.send(head(&blocks[0], "Proposed")).unwrap();
+        send.send(head(&blocks[0], "Finalized")).unwrap();
+        let mut subscriber = Subscriber::with_rpc(&node, &url, pool).await.unwrap();
+
+        if unreadable {
+            // The next block arrives whole, except for one unreadable message.
+            send.send(head(&blocks[1], "Proposed")).unwrap();
+            send.send(json!("{ not JSON")).unwrap();
+            send.send(head(&blocks[1], "Voted")).unwrap();
+            send.send(head(&blocks[1], "Finalized")).unwrap();
+            assert!(matches!(subscriber.next_update().await, Err(Error::Rpc(_))));
+        } else {
+            drop(send);
+            assert!(matches!(
+                subscriber.next_update().await,
+                Err(Error::Transport(_))
+            ));
+        }
+        assert!(matches!(
+            subscriber.next_update().await,
+            Err(Error::Discontinuous)
+        ));
+        assert_eq!(
+            subscriber.pool().snapshot().block.number,
+            snapshot(pool, &blocks[0]).block.number
+        );
+    }
 }
 
 #[tokio::test]
