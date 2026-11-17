@@ -1,13 +1,15 @@
 # ThogAMM event SDK
 
 Keep an in-memory ThogAMM quote model current through Monad subscriptions.
-Version **0.5.0** supports **schema 8 / wire 8 / model 3** and all 13 listed tokens,
-including **SPYx, QQQx, EWYx, NVDAx and TSLAx**. These are unwrapped xStocks with
-18 decimals; [token addresses](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
+Version **0.6.0** supports **schema 8 / wire 8 / model 3** with executor-stored
+xStock multipliers and the expanded 17-token registry. The nine unwrapped
+xStocks are SPYx, QQQx, EWYx, NVDAx, TSLAx, SMHx, SPCXx, MUx and SKHYx, all
+with 18 decimals. [Token addresses](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
 
-Pool/share movements come from events. **Issuer multipliers are read at every
-published block**, because a scheduled rebase can activate without a log. Quote
-calculations themselves are synchronous and make no network calls.
+Quote calculations are synchronous and make no network calls. The polling SDK
+reads each multiplier from the executor's `storedMultiplier(token)`; the event
+SDK applies `MakerMultiplierUpdated` after its initial snapshot. Issuer changes
+alone do not change the model's stored values.
 
 - Monad mainnet, chain ID **143**.
 - Pool: `0x80c74517BCC2D67fFE02D3ED886796272F647210`.
@@ -16,9 +18,11 @@ calculations themselves are synchronous and make no network calls.
 
 Model 3 was activated at Monad block **117177785** in
 [the proxy upgrade transaction](https://monadscan.com/tx/0x962e87a568d98fba303d7077f6b51242599c07446799b87f117cbd14065214d2).
-Use **v0.5.0** for model 3; v0.4.1 is retained for historical model-2 snapshots.
-The SDK rejects mismatched model identities. Verify the selected snapshot's
-identity and commit your application's `Cargo.lock`.
+Use **v0.6.0** with the stored-multiplier implementation. v0.5.0 reads issuer
+multipliers and is for the previous implementation. Schema/wire/model numbers
+remain 8/8/3, so those numbers alone do not distinguish the implementations.
+Verify the implementation address in the integration guide, reconnect after
+upgrades, and commit your application's `Cargo.lock`.
 
 The coordinated upgrade pauses both maker liquidity and taker execution while
 the shared operator backend is stopped, upgraded and restarted. The operator
@@ -31,7 +35,7 @@ and obtain a complete snapshot after the upgrade. See
 
 ```toml
 [dependencies]
-event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.5.0" }
+event-driven-sdk = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.6.0" }
 ```
 
 ```rust
@@ -54,14 +58,13 @@ async fn follow_quotes(
 }
 ```
 
-`connect()` subscribes first, then loads a finalized pool/issuer snapshot at one
-block hash. `next_update()` replays complete finalized blocks and reads current
-multipliers in a single batch of five calls per block with today's registry.
-It does not poll `getPoolData` or physical balances after startup. Use
-`model.state().block.number` and `.hash` to identify the published state; it can
-trail the proposed head. Keep consuming updates even when a quote rejects.
+`connect()` subscribes first, then loads pool state, physical shares and executor
+multipliers at one finalized block hash. `next_update()` replays complete
+finalized blocks, including `MakerMultiplierUpdated`, without RPC reads.
+Use `model.state().block.number` and `.hash` to identify the published state;
+it can trail the proposed head. Keep consuming updates even when a quote rejects.
 Active listings are dynamic; share accounting uses the contract's
-[nine compiled xStock addresses](https://github.com/thogard785/thog-amm-poll-sdk/blob/v0.4.1/model/src/shares.rs).
+[nine compiled xStock addresses](https://github.com/thogard785/thog-amm-poll-sdk/blob/v0.6.0/model/src/shares.rs).
 Listing another of those nine needs no model change; extending the contract's
 xStock catalog requires a matching SDK release.
 
@@ -117,22 +120,21 @@ Share floors, xStock dust and direct/Buy rounding are included. For calldata and
 slippage protection, see the [settlement guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#quotes-limits-and-settlement).
 
 `at_block` changes age and execution context without fetching new inventory, policy or
-issuer state. Independent quotes do not simulate successive fills.
+stored multipliers. Independent quotes do not simulate successive fills.
 
 ## Errors and custom streams
 
-A disconnect, missing block/log, failed issuer read or malformed publication
+A disconnect, missing block/log or malformed publication
 returns an error and preserves the last published snapshot. Reconnect explicitly
 with `connect()`. A registry change returns `Error::RegistryChanged`; reconnect
 and rebuild prepared pairs. On `ContractUpgraded` or an unsupported format,
 verify compatibility before using the matching release.
 
 `EventSynchronizer::from_model` accepts a snapshot with a known finalized hash.
-Feed `on_log` and `on_head(header, commitment, &multipliers_by_block_hash)` in
-socket order. Before a finalized head, call `pending_headers(&header)` and supply
-hash-pinned issuer multipliers for every returned block. The helper
-`model::rpc::read_multipliers` can fetch them. Proposed/Voted/Verified heads need
-no multiplier input. The reducer itself performs no I/O.
+Feed `on_log` and `on_head(header, commitment)` in socket order. Complete
+finalized ancestry is applied atomically, with the stored multiplier updates
+from its logs. Proposed/Voted/Verified heads do not publish model changes. The
+reducer performs no I/O; `pending_headers` exposes ancestry for custom consumers.
 
 `model::events::log_filters(pool, wmon)` covers ordinary transfers, xStock
 `TransferShares`, WMON and pool checkpoints. Use one ordered Monad connection,
@@ -155,8 +157,11 @@ Tests check 32,760 execution cases against the newly compiled model-3 contract
 on a local Monad fork, plus 25,896 historical read-only cases and 200 blocks of
 event replay with a test-only model identity migration. Historical expected
 results remain unchanged and do not validate the new defense. Tests also cover
-subscription ordering, reorgs and log-free issuer activations.
+subscription ordering, reorgs, finalized stored-multiplier events, rejection of
+invalid multiplier values and unchanged multipliers in log-free blocks.
 [Fixtures and reproduction instructions](https://github.com/thogard785/thog-amm-integration-guide#verification).
-Upgrade from 0.4.1 together with the contract migration; model-2 and schema-7
-snapshots are incompatible. Reconnect after the upgrade with this matching SDK.
+When upgrading from 0.5.0, remove multiplier-map arguments from `on_head`,
+`apply_block` and `apply_owned_block`. `EventDrivenSdk` no longer retains a reader
+or has a reader type parameter. `with_reader` still accepts a custom reader for
+the initial snapshot. Reconnect after the contract upgrade with this release.
 [MIT license](LICENSE).

@@ -17,31 +17,19 @@ fn subscription_logs_reproduce_two_hundred_deployed_checkpoints() {
         let expected = support::model(f.proxy, f.baseFee, &e.afterState);
         let h = support::model_header(&expected);
         let previous = sdk.model().state().clone();
-        assert!(sdk
-            .on_head(h.clone(), C::Proposed, &support::multiplier_blocks())
-            .unwrap()
-            .is_none());
+        assert!(sdk.on_head(h.clone(), C::Proposed).unwrap().is_none());
         // Separate filters are delivered in groups, not global log order.
         for log in support::logs(e, f.baseFee).into_iter().rev() {
             sdk.on_log(log.clone()).unwrap();
             sdk.on_log(log).unwrap(); // Overlapping filters must deduplicate.
         }
         assert_eq!(sdk.model().state(), &previous);
-        assert!(sdk
-            .on_head(h.clone(), C::Voted, &support::multiplier_blocks())
-            .unwrap()
-            .is_none());
+        assert!(sdk.on_head(h.clone(), C::Voted).unwrap().is_none());
         assert_eq!(sdk.model().state(), &previous);
-        let update = sdk
-            .on_head(h.clone(), C::Finalized, &support::multiplier_blocks())
-            .unwrap()
-            .unwrap();
+        let update = sdk.on_head(h.clone(), C::Finalized).unwrap().unwrap();
         assert_eq!(update.blocks, 1);
         assert_eq!(sdk.model().state(), expected.state());
-        assert!(sdk
-            .on_head(h, C::Verified, &support::multiplier_blocks())
-            .unwrap()
-            .is_none());
+        assert!(sdk.on_head(h, C::Verified).unwrap().is_none());
     }
     assert_eq!(sdk.model().max_index(), 12);
     assert!(!sdk.model().state().balances[0].is_zero());
@@ -55,39 +43,31 @@ fn repeated_proposal_frames_do_not_apply_balance_deltas_twice() {
     let mut sdk =
         EventSynchronizer::from_model(support::model(f.proxy, f.baseFee, &e.beforeState)).unwrap();
     for _ in 0..2 {
-        sdk.on_head(header.clone(), C::Proposed, &support::multiplier_blocks())
-            .unwrap();
+        sdk.on_head(header.clone(), C::Proposed).unwrap();
         for log in support::logs(e, f.baseFee) {
             sdk.on_log(log).unwrap();
         }
     }
-    sdk.on_head(header, C::Finalized, &support::multiplier_blocks())
-        .unwrap()
-        .unwrap();
+    sdk.on_head(header, C::Finalized).unwrap().unwrap();
     assert_eq!(sdk.model().state(), expected.state());
 }
 
 #[test]
-fn skipped_commitments_publish_only_after_all_issuer_inputs_are_supplied() {
+fn skipped_commitments_publish_only_after_complete_finalized_ancestry() {
     let f = support::fixture();
     let mut sdk =
         EventSynchronizer::from_model(support::model(f.proxy, f.baseFee, &f.events[0].beforeState))
             .unwrap();
     for e in f.events.iter().take(3) {
         let h = support::model_header(&support::model(f.proxy, f.baseFee, &e.afterState));
-        sdk.on_head(h, C::Proposed, &support::multiplier_blocks())
-            .unwrap();
+        sdk.on_head(h, C::Proposed).unwrap();
         for log in support::logs(e, f.baseFee) {
             sdk.on_log(log).unwrap();
         }
     }
     let expected = support::model(f.proxy, f.baseFee, &f.events[2].afterState);
     let update = sdk
-        .on_head(
-            support::model_header(&expected),
-            C::Finalized,
-            &support::multiplier_blocks(),
-        )
+        .on_head(support::model_header(&expected), C::Finalized)
         .unwrap()
         .unwrap();
     assert_eq!(update.blocks, 3);
@@ -101,28 +81,18 @@ fn abandoned_proposals_never_change_the_finalized_model() {
     let mut sdk = EventSynchronizer::from_model(seed.clone()).unwrap();
     let mut orphan = support::header(n, f.baseFee);
     orphan.hash = support::hash(n, 1);
-    sdk.on_head(orphan.clone(), C::Proposed, &support::multiplier_blocks())
-        .unwrap();
+    sdk.on_head(orphan.clone(), C::Proposed).unwrap();
     let mut logs = support::logs(&f.events[0], f.baseFee);
     for log in &mut logs {
         log.block_hash = orphan.hash;
         sdk.on_log(log.clone()).unwrap();
     }
     let canonical = support::header(n, f.baseFee);
-    sdk.on_head(
-        canonical.clone(),
-        C::Proposed,
-        &support::multiplier_blocks(),
-    )
-    .unwrap();
+    sdk.on_head(canonical.clone(), C::Proposed).unwrap();
     // The winning block has no pool logs.
-    sdk.on_head(
-        canonical.clone(),
-        C::Finalized,
-        &support::multiplier_blocks(),
-    )
-    .unwrap()
-    .unwrap();
+    sdk.on_head(canonical.clone(), C::Finalized)
+        .unwrap()
+        .unwrap();
     let mut expected = seed.into_state();
     expected.block = canonical.into();
     assert_eq!(sdk.model().state(), &expected);
@@ -135,13 +105,11 @@ fn missing_proposal_is_reported_without_inventing_an_empty_block() {
     let mut sdk = EventSynchronizer::from_model(seed).unwrap();
     let h = support::header(previous.block.number + 1, f.baseFee);
     assert!(matches!(
-        sdk.on_head(h.clone(), C::Finalized, &support::multiplier_blocks()),
+        sdk.on_head(h.clone(), C::Finalized),
         Err(Error::Discontinuous)
     ));
     assert_eq!(sdk.model().state(), &previous);
-    assert!(sdk
-        .on_head(h, C::Proposed, &support::multiplier_blocks())
-        .is_err());
+    assert!(sdk.on_head(h, C::Proposed).is_err());
 }
 #[test]
 fn malformed_logs_and_balance_mismatches_are_atomic_errors_without_reseed() {
@@ -151,8 +119,7 @@ fn malformed_logs_and_balance_mismatches_are_atomic_errors_without_reseed() {
         let previous = seed.state().clone();
         let mut sdk = EventSynchronizer::from_model(seed).unwrap();
         let h = support::header(previous.block.number + 1, f.baseFee);
-        sdk.on_head(h.clone(), C::Proposed, &support::multiplier_blocks())
-            .unwrap();
+        sdk.on_head(h.clone(), C::Proposed).unwrap();
         let event = abi::Transfer {
             from: f.proxy,
             to: thogamm_model::Address::ZERO,
@@ -174,9 +141,7 @@ fn malformed_logs_and_balance_mismatches_are_atomic_errors_without_reseed() {
             removed: false,
         })
         .unwrap();
-        let err = sdk
-            .on_head(h, C::Finalized, &support::multiplier_blocks())
-            .unwrap_err();
+        let err = sdk.on_head(h, C::Finalized).unwrap_err();
         assert!(if arithmetic {
             matches!(err, Error::Arithmetic)
         } else {
@@ -191,8 +156,7 @@ fn upgrade_is_explicit_and_requires_a_compatible_model() {
     let seed = support::model(f.proxy, f.baseFee, &f.events[0].beforeState);
     let h = support::header(seed.state().block.number + 1, f.baseFee);
     let mut sdk = EventSynchronizer::from_model(seed).unwrap();
-    sdk.on_head(h.clone(), C::Proposed, &support::multiplier_blocks())
-        .unwrap();
+    sdk.on_head(h.clone(), C::Proposed).unwrap();
     let event = abi::Upgraded {
         implementation: f.proxy,
     }
@@ -209,7 +173,7 @@ fn upgrade_is_explicit_and_requires_a_compatible_model() {
     })
     .unwrap();
     assert!(matches!(
-        sdk.on_head(h, C::Finalized, &support::multiplier_blocks()),
+        sdk.on_head(h, C::Finalized),
         Err(Error::ContractUpgraded)
     ));
 }
@@ -222,7 +186,7 @@ fn log(l: &RpcLog) -> Value {
     json!({"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"sub1","result":l}})
 }
 #[tokio::test]
-async fn websocket_updates_read_only_issuer_multipliers_after_startup() {
+async fn websocket_updates_perform_no_rpc_after_startup() {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let f = support::fixture();
         let rpc = support::MockRpc::from_events(&f);
@@ -306,11 +270,11 @@ async fn websocket_updates_read_only_issuer_multipliers_after_startup() {
         .unwrap();
         assert_eq!(rpc.call_count(), 11);
         send.send(()).unwrap();
-        for (i, e) in f.events.iter().enumerate() {
+        for e in &f.events {
             sdk.next_update().await.unwrap();
             let expected: PoolModel = support::model(f.proxy, f.baseFee, &e.afterState);
             assert_eq!(sdk.model().state(), expected.state());
-            assert_eq!(rpc.call_count(), 11 + 5 * (i + 1));
+            assert_eq!(rpc.call_count(), 11);
         }
         // Only the initial refresh reads getPoolData or physical shares.
         assert_eq!(
@@ -325,7 +289,7 @@ async fn websocket_updates_read_only_issuer_multipliers_after_startup() {
             1
         );
         assert!(sdk.next_update().await.is_err());
-        assert_eq!(rpc.call_count(), 11 + 5 * f.events.len());
+        assert_eq!(rpc.call_count(), 11);
         server.await.unwrap();
     })
     .await
@@ -339,8 +303,7 @@ fn registry_retirement_requires_an_explicit_complete_snapshot() {
     let before = seed.state().clone();
     let h = support::header(before.block.number + 1, f.baseFee);
     let mut sdk = EventSynchronizer::from_model(seed).unwrap();
-    sdk.on_head(h.clone(), C::Proposed, &support::multiplier_blocks())
-        .unwrap();
+    sdk.on_head(h.clone(), C::Proposed).unwrap();
     let event = abi::MakerTokenRetired {
         retiredIndex: 1,
         token: before.tokens[1].token,
@@ -360,50 +323,89 @@ fn registry_retirement_requires_an_explicit_complete_snapshot() {
     })
     .unwrap();
     assert!(matches!(
-        sdk.on_head(h, C::Finalized, &support::multiplier_blocks()),
+        sdk.on_head(h, C::Finalized),
         Err(Error::RegistryChanged)
     ));
     assert_eq!(sdk.model().state(), &before);
 }
 
 #[test]
-fn issuer_activation_without_logs_revalues_shares_before_publication() {
+fn multiplier_changes_only_when_the_executor_emits_its_stored_value() {
     let f = support::fixture();
     let seed = support::model(f.proxy, f.baseFee, &f.events[0].beforeState);
     let mut expected = seed.state().clone();
     let h = support::header(expected.block.number + 1, f.baseFee);
-    let mut multipliers = support::multipliers_for(&seed);
-    for value in multipliers.values_mut() {
-        *value = *value * U256::from(3) / U256::from(2);
-    }
-    expected.update_multipliers(&multipliers).unwrap();
+    let token = *expected.share_balances.keys().next().unwrap();
+    let value = expected.share_balances[&token].multiplier * U256::from(3) / U256::from(2);
+    expected.share_balances.get_mut(&token).unwrap().multiplier = value;
+    expected.refresh_share_balances().unwrap();
     expected.block = h.clone().into();
-    let mut sdk = EventSynchronizer::from_model(seed).unwrap();
-    sdk.on_head(h.clone(), C::Proposed, &Default::default())
-        .unwrap();
-    assert_ne!(sdk.model().state(), &expected);
-    sdk.on_head(
-        h.clone(),
-        C::Finalized,
-        &std::collections::BTreeMap::from([(h.hash, multipliers)]),
-    )
-    .unwrap()
+    let mut sdk = EventSynchronizer::from_model(seed.clone()).unwrap();
+    sdk.on_head(h.clone(), C::Proposed).unwrap();
+    let event = abi::MakerMultiplierUpdated {
+        token,
+        multiplier: value,
+    }
+    .encode_log_data();
+    sdk.on_log(RpcLog {
+        address: f.proxy,
+        topics: event.topics().to_vec(),
+        data: event.data,
+        block_hash: h.hash,
+        block_number: h.number,
+        transaction_index: 0,
+        log_index: 0,
+        removed: false,
+    })
     .unwrap();
+    assert_eq!(
+        sdk.model().state(),
+        seed.state(),
+        "proposed sync changed the published model"
+    );
+    sdk.on_head(h, C::Finalized).unwrap().unwrap();
     assert_eq!(sdk.model().state(), &expected);
 }
 
 #[test]
-fn missing_issuer_state_cannot_publish_a_stale_multiplier() {
+fn a_log_free_block_keeps_the_executors_stored_multipliers() {
     let f = support::fixture();
     let seed = support::model(f.proxy, f.baseFee, &f.events[0].beforeState);
-    let before = seed.state().clone();
-    let h = support::header(before.block.number + 1, f.baseFee);
+    let mut expected = seed.state().clone();
+    let h = support::header(expected.block.number + 1, f.baseFee);
+    expected.block = h.clone().into();
     let mut sdk = EventSynchronizer::from_model(seed).unwrap();
-    sdk.on_head(h.clone(), C::Proposed, &Default::default())
+    sdk.on_head(h.clone(), C::Proposed).unwrap();
+    sdk.on_head(h, C::Finalized).unwrap().unwrap();
+    assert_eq!(sdk.model().state(), &expected);
+}
+
+#[test]
+fn invalid_stored_multiplier_never_changes_the_published_state() {
+    let f = support::fixture();
+    for multiplier in [U256::ZERO, U256::ONE << 128usize] {
+        let seed = support::model(f.proxy, f.baseFee, &f.events[0].beforeState);
+        let before = seed.state().clone();
+        let token = *before.share_balances.keys().next().unwrap();
+        let h = support::header(before.block.number + 1, f.baseFee);
+        let mut sdk = EventSynchronizer::from_model(seed).unwrap();
+        sdk.on_head(h.clone(), C::Proposed).unwrap();
+        let event = abi::MakerMultiplierUpdated { token, multiplier }.encode_log_data();
+        sdk.on_log(RpcLog {
+            address: f.proxy,
+            topics: event.topics().to_vec(),
+            data: event.data,
+            block_hash: h.hash,
+            block_number: h.number,
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        })
         .unwrap();
-    assert!(matches!(
-        sdk.on_head(h, C::Finalized, &Default::default()),
-        Err(Error::InvalidData(_))
-    ));
-    assert_eq!(sdk.model().state(), &before);
+        assert!(matches!(
+            sdk.on_head(h, C::Finalized),
+            Err(Error::InvalidData(_))
+        ));
+        assert_eq!(sdk.model().state(), &before);
+    }
 }

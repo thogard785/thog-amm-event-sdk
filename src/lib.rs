@@ -1,5 +1,5 @@
 //! Quote ThogAMM locally in your aggregator using state kept up to date by events.
-//! Events update pool/share state; hash-pinned issuer reads track multiplier activations.
+//! Events update pool/share state and executor-stored xStock multipliers.
 //! Published snapshots represent complete finalized blocks on Monad.
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -7,8 +7,8 @@ use std::collections::{btree_map::Entry, BTreeMap, VecDeque};
 pub use thogamm_model::{self as model, Address, Error, PoolModel, Result, U256};
 use thogamm_model::{
     events::{apply_owned_block, log_filters},
-    rpc::{read_multipliers, snapshot, CallBlock, ChainReader, HttpRpc},
-    BlockHeader, Multipliers, RpcLog, B256,
+    rpc::{snapshot, CallBlock, ChainReader, HttpRpc},
+    BlockHeader, RpcLog, B256,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
@@ -117,8 +117,7 @@ impl EventSynchronizer {
         }
         Ok(())
     }
-    /// Headers needed to finalize this ancestry, in increasing order. Fetch issuer
-    /// multipliers at each returned hash before calling on_head for a finalized head.
+    /// Headers needed to finalize this ancestry, in increasing order.
     pub fn pending_headers(&self, header: &BlockHeader) -> Result<Vec<BlockHeader>> {
         let current = &self.model.state().block;
         let mut path = Vec::new();
@@ -144,12 +143,11 @@ impl EventSynchronizer {
         &mut self,
         header: BlockHeader,
         commitment: CommitState,
-        multipliers: &BTreeMap<B256, Multipliers>,
     ) -> Result<Option<Update>> {
         if self.failed {
             return Err(Error::Discontinuous);
         }
-        let result = self.apply_head(header, commitment, multipliers);
+        let result = self.apply_head(header, commitment);
         if result.is_err() {
             self.failed = true;
         }
@@ -159,7 +157,6 @@ impl EventSynchronizer {
         &mut self,
         header: BlockHeader,
         commitment: CommitState,
-        multipliers: &BTreeMap<B256, Multipliers>,
     ) -> Result<Option<Update>> {
         // Monad serializes every prior block's complete set of log filters before
         // starting this header notification on the same WebSocket connection.
@@ -207,17 +204,9 @@ impl EventSynchronizer {
             }
         }
         let mut next = self.model.state().clone();
-        let empty = Multipliers::new();
         for h in &path {
             let block = &self.pending[&h.hash];
-            let values = if next.share_balances.is_empty() {
-                &empty
-            } else {
-                multipliers
-                    .get(&h.hash)
-                    .ok_or_else(|| Error::InvalidData("missing finalized issuer state".into()))?
-            };
-            next = apply_owned_block(next, block.header.clone(), block.logs.values(), values)?;
+            next = apply_owned_block(next, block.header.clone(), block.logs.values())?;
         }
         let update = Update {
             blocks: header.number - current.number,
@@ -237,18 +226,17 @@ enum Subscription {
 }
 type Subscriptions = BTreeMap<String, Subscription>;
 
-/// Pool updates come from subscriptions. Issuer multipliers are read at each
-/// published block because scheduled changes need not emit any event.
-pub struct EventDrivenSdk<R = HttpRpc> {
-    reader: R,
+/// Pool, share and stored multiplier updates come from subscriptions after the
+/// initial snapshot. The steady-state update path performs no RPC reads.
+pub struct EventDrivenSdk {
     synchronizer: EventSynchronizer,
     socket: Socket,
     subscriptions: Subscriptions,
     queued: VecDeque<Value>,
 }
-impl EventDrivenSdk<HttpRpc> {
+impl EventDrivenSdk {
     /// Connect using Monad HTTP/WebSocket endpoints and the ThogAMM pool address.
-    /// Establishes subscriptions and loads one atomic pool/issuer snapshot.
+    /// Establishes subscriptions and loads one atomic pool/share/stored-multiplier snapshot.
     pub async fn connect(
         http_url: impl Into<String>,
         ws_url: impl AsRef<str>,
@@ -258,9 +246,9 @@ impl EventDrivenSdk<HttpRpc> {
         Self::with_reader(HttpRpc::new(http_url)?, ws_url, proxy, config).await
     }
 }
-impl<R: ChainReader> EventDrivenSdk<R> {
-    /// Use a custom reader for the initial state and subsequent issuer multipliers.
-    pub async fn with_reader(
+impl EventDrivenSdk {
+    /// Use a custom reader for the initial block-pinned snapshot.
+    pub async fn with_reader<R: ChainReader>(
         reader: R,
         ws_url: impl AsRef<str>,
         proxy: Address,
@@ -306,7 +294,6 @@ impl<R: ChainReader> EventDrivenSdk<R> {
             ));
         }
         Ok(Self {
-            reader,
             synchronizer: EventSynchronizer::from_model(model)?,
             socket,
             subscriptions,
@@ -316,8 +303,8 @@ impl<R: ChainReader> EventDrivenSdk<R> {
     pub fn model(&self) -> &PoolModel {
         self.synchronizer.model()
     }
-    /// Consumes subscriptions and refreshes issuer multipliers before publishing.
-    /// Missing events or failed reads are reported; reconnect explicitly.
+    /// Consumes subscriptions and publishes complete finalized blocks.
+    /// Missing events are reported; reconnect explicitly.
     pub async fn next_update(&mut self) -> Result<Update> {
         if self.synchronizer.failed {
             return Err(Error::Discontinuous);
@@ -342,27 +329,7 @@ impl<R: ChainReader> EventDrivenSdk<R> {
                     )?,
                     Subscription::Heads => {
                         let (header, commitment) = parse_head(payload)?;
-                        let mut multipliers = BTreeMap::new();
-                        if commitment == CommitState::Finalized
-                            && !self.model().state().share_balances.is_empty()
-                        {
-                            let tokens: Vec<_> = self
-                                .model()
-                                .state()
-                                .share_balances
-                                .keys()
-                                .copied()
-                                .collect();
-                            for block in self.synchronizer.pending_headers(&header)? {
-                                let values =
-                                    read_multipliers(&self.reader, &tokens, block.hash).await?;
-                                multipliers.insert(block.hash, values);
-                            }
-                        }
-                        if let Some(update) =
-                            self.synchronizer
-                                .on_head(header, commitment, &multipliers)?
-                        {
+                        if let Some(update) = self.synchronizer.on_head(header, commitment)? {
                             return Ok(update);
                         }
                     }

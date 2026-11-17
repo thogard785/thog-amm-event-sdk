@@ -212,14 +212,11 @@ impl thogamm_model::rpc::ChainReader for MockRpc {
                     abi::getPoolDataCall::abi_encode_returns(&p)
                 } else if data.starts_with(&abi::sharesOfCall::SELECTOR) {
                     abi::sharesOfCall::abi_encode_returns(&shares[&to].shares)
-                } else if data.starts_with(&abi::getCurrentMultiplierCall::SELECTOR) {
-                    abi::getCurrentMultiplierCall::abi_encode_returns(
-                        &abi::getCurrentMultiplierReturn {
-                            multiplier: shares[&to].multiplier,
-                            activation: U256::ZERO,
-                            period: U256::ZERO,
-                        },
-                    )
+                } else if data.starts_with(&abi::storedMultiplierCall::SELECTOR) {
+                    let token = abi::storedMultiplierCall::abi_decode_validate(&data)
+                        .unwrap()
+                        .token;
+                    abi::storedMultiplierCall::abi_encode_returns(&shares[&token].multiplier)
                 } else {
                     panic!("unexpected calldata {data}")
                 };
@@ -283,24 +280,6 @@ pub fn shares_for(p: &abi::PoolData) -> thogamm_model::ShareBalances {
         .or_else(|| candidates.values().find(valid))
         .expect("fixture issuer state not found")
         .clone()
-}
-pub fn multipliers_for(m: &PoolModel) -> thogamm_model::Multipliers {
-    m.state()
-        .share_balances
-        .iter()
-        .map(|(a, b)| (*a, b.multiplier))
-        .collect()
-}
-pub fn multiplier_blocks() -> BTreeMap<B256, thogamm_model::Multipliers> {
-    share_images()
-        .iter()
-        .map(|(n, shares)| {
-            (
-                hash(*n, 0),
-                shares.iter().map(|(a, b)| (*a, b.multiplier)).collect(),
-            )
-        })
-        .collect()
 }
 /// Expected snapshot for the mock reader’s deterministic header.
 pub fn polled_model(proxy: Address, bytes: &Bytes) -> PoolModel {

@@ -107,29 +107,13 @@ fn replay_two_hundred_deployed_blocks_matches_every_snapshot() {
         let logs: Vec<thogamm_model::RpcLog> = serde_json::from_value(b["logs"].clone()).unwrap();
         count += logs.len();
         let h: thogamm_model::BlockHeader = serde_json::from_value(b["header"].clone()).unwrap();
-        sdk.on_head(
-            h.clone(),
-            event_driven_sdk::CommitState::Proposed,
-            &Default::default(),
-        )
-        .unwrap();
+        sdk.on_head(h.clone(), event_driven_sdk::CommitState::Proposed)
+            .unwrap();
         for log in logs {
             sdk.on_log(log).unwrap();
         }
-        sdk.on_head(
-            h.clone(),
-            event_driven_sdk::CommitState::Finalized,
-            &std::collections::BTreeMap::from([(
-                h.hash,
-                decode(b)
-                    .state()
-                    .share_balances
-                    .iter()
-                    .map(|(a, b)| (*a, b.multiplier))
-                    .collect(),
-            )]),
-        )
-        .unwrap();
+        sdk.on_head(h.clone(), event_driven_sdk::CommitState::Finalized)
+            .unwrap();
         let state = sdk.model().state();
         let expected = decode(b).into_state();
         assert_eq!(state.block, expected.block);
