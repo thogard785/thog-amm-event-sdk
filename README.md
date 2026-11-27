@@ -7,7 +7,7 @@ reads.
 
 - Network: Monad mainnet, chain ID 143
 - Pool: `0x80c74517BCC2D67fFE02D3ED886796272F647210`
-- Supports implementation `0xb108a1daf3c9ba52778b97a15ebdfa3f6f59b506`
+- Supports implementation `0xf83c81c62c4cc1942003983919c03f5fd06d3eb4`
 - Needs a Monad HTTP endpoint and a Monad WebSocket endpoint that serves the
   [`monadNewHeads`](https://docs.monad.xyz/reference/json-rpc/overview#websocket-subscriptions)
   subscription
@@ -23,7 +23,7 @@ which is simpler to run if one HTTP request per refresh suits you.
 
 ```toml
 [dependencies]
-thogamm-events = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.7.0" }
+thogamm-events = { git = "https://github.com/thogard785/thog-amm-event-sdk", tag = "v0.7.1" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

@@ -1,6 +1,6 @@
 [package]
 name = "thogamm-events"
-version = "0.7.0"
+version = "0.7.1"
 description = "Keep a ThogAMM pool current from a Monad WebSocket subscription, and quote it locally"
 edition = "2021"
 rust-version = "1.88"
@@ -11,7 +11,7 @@ readme = "README.md"
 repository = "https://github.com/thogard785/thog-amm-event-sdk"
 
 [dependencies]
-thogamm = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.7.0" }
+thogamm = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.7.1" }
 futures-util = { version = "0.3.31", features = ["sink"] }
 serde_json = "1.0"
 tokio = { version = "1.48", features = ["net", "time"] }
