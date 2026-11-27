@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use serde_json::Value;
 use thogamm_events::{
-    thogamm::{abi, abi::SolEvent, Snapshot},
+    thogamm::{abi, abi::SolEvent, Address, Snapshot},
     BlockHeader, CommitState as C, Error, Follower, Log, B256,
 };
 
@@ -77,6 +77,26 @@ fn follows_fifty_recorded_blocks_through_every_commit_state() {
         assert_follows(&follower, &recorded.read(index));
         assert!(!follower.on_head(header, C::Verified).unwrap());
     }
+}
+
+#[test]
+fn replays_antx_transfers_into_an_empty_holding() {
+    let recorded = Recorded {
+        f: fixture("events-18.json.gz"),
+    };
+    let antx: Address = "0x909369940f22dc1c143ac78753a33f41597138b1"
+        .parse()
+        .unwrap();
+    let before = recorded.read(0);
+    let index = before.tokens.iter().position(|&t| t == antx).unwrap();
+    assert!(before.xstocks[index].as_ref().unwrap().shares.is_zero());
+
+    let mut follower = recorded.follower();
+    recorded.propose(&mut follower, 1);
+    assert!(follower.on_head(recorded.header(1), C::Finalized).unwrap());
+    let after = recorded.read(1);
+    assert!(!after.xstocks[index].as_ref().unwrap().shares.is_zero());
+    assert_follows(&follower, &after);
 }
 
 #[test]

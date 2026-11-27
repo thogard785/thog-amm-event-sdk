@@ -2386,8 +2386,8 @@ dependencies = [
 
 [[package]]
 name = "thogamm"
-version = "0.7.0"
-source = "git+https://github.com/thogard785/thog-amm-poll-sdk?tag=v0.7.0#c658214a49d24b6c825b61d15c41a6afa021fbd8"
+version = "0.7.1"
+source = "git+https://github.com/thogard785/thog-amm-poll-sdk?tag=v0.7.1#c3484ab042b4289be9f6aec951d596115c52bc14"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -2399,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "thogamm-events"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "flate2",
  "futures-util",
